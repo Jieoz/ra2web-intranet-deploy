@@ -6,13 +6,22 @@
 
 ## 两条路线
 
-| | `build-ra2-intranet.sh` | `fetch-ra2-resources.sh` |
+| | 现成站点包 | `build-ra2-intranet.sh` |
 |---|---|---|
-| 做什么 | 克隆上游 → 打补丁 → 构建 → 拉资源 | 只拉资源，客户端用预构建包 |
-| 依赖 | git、python3、curl、tar（node 可选，见下） | python3、curl |
-| 适用 | 想从源码自己构建 | 机器上 node 版本低或不想装 node |
+| 做什么 | 下载 Release 里的成品 tar.gz，解压即用 | 克隆上游 → 打补丁 → 构建 → 拉资源 |
+| 依赖 | `tar` | git、python3、curl、tar（node 可选，见下） |
+| 适用 | 只想部署，不关心构建 | 想自己从源码构建 |
 
-### 路线 A：从源码构建
+### 路线 A：现成站点包（最省事）
+
+Release 里的 `ra2web-intranet-site.tar.gz` 是完整成品站点（约 90MB 压缩 / 197MB 解压后），资源已就位，解压即可托管：
+
+```bash
+tar -xzf ra2web-intranet-site.tar.gz
+cd client && python3 -m http.server 8080 --bind 0.0.0.0
+```
+
+### 路线 B：从源码构建
 
 ```bash
 bash build-ra2-intranet.sh [输出目录]    # 默认 ./ra2-intranet
@@ -23,7 +32,7 @@ bash build-ra2-intranet.sh [输出目录]    # 默认 ./ra2-intranet
 - 不满足 → 自动下载便携版 Node 到 `<输出目录>/toolchain/`，只在构建期使用，不碰系统环境、不需要 root
 - `RA2_FORCE_NODE=1` 可强制走便携版
 
-便携版 Node 官方二进制需要 glibc >= 2.28（CentOS 7 / Ubuntu 18.04 等老系统不满足），脚本会自动回退到 [unofficial-builds](https://unofficial-builds.nodejs.org/) 的 glibc-2.17 变体。
+便携版 Node 官方二进制需要 glibc >= 2.28（CentOS 7 / Ubuntu 18.04 等老系统不满足），脚本会自动回退到 [unofficial-builds](https://unofficial-builds.nodejs.org/) 的 glibc-2.17 变体。若两者都跑不起来，脚本会明确报错并提示改用路线 A，而不是继续往下崩。
 
 产物结构：
 
@@ -34,16 +43,19 @@ bash build-ra2-intranet.sh [输出目录]    # 默认 ./ra2-intranet
 └── webroot/      # ← 这个才是要拷进内网的成品站点
 ```
 
-### 路线 B：预构建客户端 + 只拉资源
+### 只补资源
 
-客户端产物只有 9.4MB 且不含任何机器特定内容，可以在任意机器上构建好后分发。这条路线完全不需要 node：
+如果客户端已有（比如从 Release 拿的 `ra2web-client-dist.zip`），只想拉资源：
 
 ```bash
-unzip ra2web-client-dist.zip     # 得到 client/ 目录
-bash fetch-ra2-resources.sh client
+bash fetch-ra2-resources.sh <客户端目录>
 ```
 
-`fetch-ra2-resources.sh` 支持断点续跑——已下载且 CRC 校验通过的文件会跳过，中断后重跑不会重复下载。
+`build-ra2-intranet.sh` 的资源步骤也是调用这个脚本，资源逻辑全仓库只有这一份实现。
+
+**受限网络**：脚本走 `curl`，直接 `export https_proxy=http://host:port` 即可继承。
+
+**断点续跑**：已下载且 CRC 与官方一致的文件跳过，上一轮生成的占位图也会被识别并沿用，中断后重跑只补缺的。
 
 ## 内网部署
 
@@ -61,7 +73,11 @@ cd webroot && python3 -m http.server 8080 --bind 0.0.0.0
 
 2. **清空所有外网引用** — `config.ini` 里的资源包下载地址、更新公告、排行榜规则、mod SDK、Discord 链接全部置空；`servers.ini` 只留一个不可用的占位 LAN 条目，摘掉官方对战服（`wolUrl` 指向 k0s.cn / wangerhuoda.cn）。全仓唯一剩余硬编码外链是 Sentry，而不配置 `[Sentry]` 段就不会加载。
 
-3. **资源本地化** — 按 `manifest.json` 逐项拉取 33 个资源文件（约 187MB）并 CRC 校验。官方 CDN 有 UA / Referer 反盗链，脚本带上对应请求头。其中 10 张阵营加载图 + `glsl.png` 官方已下架（404），脚本生成内网占位图替代（装了 `python3-pillow` 就画中文标题，否则纯色底图），最后**全量重写 manifest 校验和**保证包内自洽。
+3. **资源本地化** — 按官方 `manifest.json` 逐项拉取 33 个资源文件（约 187MB）。官方 CDN 有 UA / Referer 反盗链，脚本带上对应请求头。
+
+   每个文件下载后都比对官方 CRC32 才算通过——反盗链会返回 HTTP 200 的 HTML 伪装页，代理或网络中断会返回截断文件，两者都是「curl 退出码 0」但内容是坏的。`.mix` 游戏数据校验不通过直接退出并报明原因，绝不拿坏文件糊过去。
+
+   其中 10 张阵营加载图 + `glsl.png` 官方已下架（404），这些只是加载画面装饰，脚本生成内网占位图替代（装了 `python3-pillow` 就画中文标题，否则纯色底图），并只对这几项重写校验和保证包内自洽。完成时会分别报告「N 项与官方逐字节一致 / M 项为本地占位图」。
 
 ## 运行期外网依赖
 
