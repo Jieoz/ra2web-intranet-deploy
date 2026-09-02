@@ -1,26 +1,51 @@
 # ra2web-intranet-deploy
 
-一键构建**网页版红警2的纯静态内网离线站点**。在有外网的机器上跑一次，产出的 `webroot/` 整体拷进内网，任意静态文件服务器托管即可，运行期零外网依赖。
+一键构建**网页版红警2的纯静态内网离线站点**。在有外网的机器上跑一次，产出的成品目录整体拷进内网，任意静态文件服务器托管即可，运行期零外网依赖。
 
 上游游戏客户端是 [huangkaoya/redalert2](https://github.com/huangkaoya/redalert2)（RA2Web / 《时空分裂》Chronodivide 中文版客户端的 React + TypeScript + Three.js 重构版）。本仓库**只提供构建与内网化脚本**，不分发任何游戏客户端代码或美术资源。
 
-## 用法
+## 两条路线
+
+| | `build-ra2-intranet.sh` | `fetch-ra2-resources.sh` |
+|---|---|---|
+| 做什么 | 克隆上游 → 打补丁 → 构建 → 拉资源 | 只拉资源，客户端用预构建包 |
+| 依赖 | git、python3、curl、tar（node 可选，见下） | python3、curl |
+| 适用 | 想从源码自己构建 | 机器上 node 版本低或不想装 node |
+
+### 路线 A：从源码构建
 
 ```bash
 bash build-ra2-intranet.sh [输出目录]    # 默认 ./ra2-intranet
 ```
 
-依赖：`git`、`node >= 20`（含 npm）、`python3`、`curl`。可选 `python3-pillow`（用于生成占位加载图，缺失则跳过）。
+**Node 版本要求**：上游用 vite 8 + rolldown，需要 `node ^20.19 || >=22.12`。脚本会自动检测：
+- 系统 node 满足要求 → 直接用
+- 不满足 → 自动下载便携版 Node 到 `<输出目录>/toolchain/`，只在构建期使用，不碰系统环境、不需要 root
+- `RA2_FORCE_NODE=1` 可强制走便携版
+
+便携版 Node 官方二进制需要 glibc >= 2.28（CentOS 7 / Ubuntu 18.04 等老系统不满足），脚本会自动回退到 [unofficial-builds](https://unofficial-builds.nodejs.org/) 的 glibc-2.17 变体。
 
 产物结构：
 
 ```
 <输出目录>/
+├── toolchain/    # 便携 Node（若下载过），构建完可删
 ├── redalert2/    # 上游 git 克隆 + node_modules（构建中间产物，可删）
 └── webroot/      # ← 这个才是要拷进内网的成品站点
 ```
 
-内网部署：
+### 路线 B：预构建客户端 + 只拉资源
+
+客户端产物只有 9.4MB 且不含任何机器特定内容，可以在任意机器上构建好后分发。这条路线完全不需要 node：
+
+```bash
+unzip ra2web-client-dist.zip     # 得到 client/ 目录
+bash fetch-ra2-resources.sh client
+```
+
+`fetch-ra2-resources.sh` 支持断点续跑——已下载且 CRC 校验通过的文件会跳过，中断后重跑不会重复下载。
+
+## 内网部署
 
 ```bash
 cd webroot && python3 -m http.server 8080 --bind 0.0.0.0
@@ -28,44 +53,25 @@ cd webroot && python3 -m http.server 8080 --bind 0.0.0.0
 
 玩家浏览器访问 `http://<内网IP>:8080/`，关掉 MOD 导入弹窗即进主菜单。多人对战走**主菜单 → 局域网(LAN) → 创建房间**生成邀请码，同一内网互通。
 
+生产环境建议换 nginx / caddy，别用 `http.server`（单线程、无并发）。
+
 ## 脚本做了什么
 
-七步，每步都有进度输出：
+1. **纯 CDN 模式补丁** — 上游 `VirtualFileSystem.ts` 假定用户会通过浏览器 File System Access API 授予本地 RA2 安装目录（`this.rfs`）。内网纯 CDN 模式下没有这个句柄，`this.rfs` 为 `undefined` 会抛 `TypeError`。脚本给 5 处调用加空值保护，用正则按表达式替换而非上下文 diff，因此对上游缩进变动不敏感，且幂等（重复运行会跳过）。
 
-1. 准备输出目录（内部会 `cd` 进仓库，所以路径先绝对化——相对路径在这里会算错）
-2. `git clone --depth 1` 上游仓库
-3. **打纯 CDN 模式补丁**（见下）
-4. 写入内网化的 `config.ini` / `servers.ini`：资源基址全部指向本地 `/cdn/...`，关闭 Discord、快速匹配、排位队列，开启 bot，默认中文
-5. `npm ci` + `vite build`（纯 node，不需要 bun）
-6. 从官方 CDN 拉取约 187MB 游戏资源，按 `manifest.json` 的 CRC32 逐文件校验，只补缺失或损坏的
-7. 同步构建产物到 `webroot/`，保留已下载的 `cdn/` 资源目录
+2. **清空所有外网引用** — `config.ini` 里的资源包下载地址、更新公告、排行榜规则、mod SDK、Discord 链接全部置空；`servers.ini` 只留一个不可用的占位 LAN 条目，摘掉官方对战服（`wolUrl` 指向 k0s.cn / wangerhuoda.cn）。全仓唯一剩余硬编码外链是 Sentry，而不配置 `[Sentry]` 段就不会加载。
 
-## 关于那个补丁
+3. **资源本地化** — 按 `manifest.json` 逐项拉取 33 个资源文件（约 187MB）并 CRC 校验。官方 CDN 有 UA / Referer 反盗链，脚本带上对应请求头。其中 10 张阵营加载图 + `glsl.png` 官方已下架（404），脚本生成内网占位图替代（装了 `python3-pillow` 就画中文标题，否则纯色底图），最后**全量重写 manifest 校验和**保证包内自洽。
 
-上游的 `VirtualFileSystem` 假定始终存在 `RealFileSystem`（本地导入的游戏文件）。纯 CDN 模式下 `this.rfs` 是 `undefined`，`getEntries()` / `openFile()` 会直接抛 `TypeError`。
+## 运行期外网依赖
 
-补丁**不是 diff，也不贴源码当锚点** —— 那种方式对缩进、空白、行尾、git 版本都敏感，换台机器就失败。这里改成表达式级正则替换：只把类字段与构造参数改为可选，再给每处 `this.rfs.xxx()` 调用套上空值兜底，完全不看上下文和缩进。
+零。构建完成后 `webroot/` 内所有资源路径都是站点内相对路径，断网可完整运行单人遭遇战与局域网对战。
 
-两道自检保证它不会静默出错：
+局域网联机走上游内置的 WebRTC mesh（`src/network/lan/`），`RTCPeerConnection` 配置为 `iceServers: []`，不依赖任何 STUN / TURN 服务器，信令通过二维码或手动交换 SDP 完成——因此在完全隔离的内网里也能建立连接。
 
-- **计数断言**：改完统计裸调用数与受保护调用数，不相等就退出报错
-- **幂等检测**：开头检查是否已打过补丁，避免重复运行嵌套成 `this.rfs ? (this.rfs ? ...)`
-- 若所有正则都没命中（上游源码结构变了），报 `上游源码结构已变更` 并退出，而不是继续构建出一个坏包
+## 授权与法律
 
-资源侧另有一处兜底：官方已下架若干 PNG 加载图，脚本在有 pillow 时生成中文占位图，并**全量重写 `manifest.json` 的校验和**，保证离线包自洽——否则客户端会因 CRC 不匹配反复重试下载。
-
-## 验证过什么
-
-- 全新空目录连跑两次：首次 `补丁应用成功（5 处 this.rfs 调用已加空值保护）`，复跑 `补丁已存在，跳过`，两次产物一致且源码无嵌套
-- 33 项资源 CRC 全部校验通过
-- 产物起本地服务后用浏览器实测：`manifest.json`、`ini.mix`、`ui.mix`、`strings.mix` 全部 200，无 `getEntries` 崩溃，引擎推进到渲染器阶段
-
-headless 无 GPU 时会卡在 WebGL 初始化，真机浏览器无此问题。
-
-## 免责声明与授权
-
-上游项目基于对 RA2Web / 《时空分裂》(Chronodivide) 中文版的分析开发，**项目全部权利（含收益权）归《时空分裂》/ RA2WEB 负责人所有**。《时空分裂》所有者从未以任何形式开源游戏客户端代码。
-
-未经权利人许可，**严禁任何商业用途**，包括但不限于植入广告、封装收费、以"作者"身份骗取赞助或充电收益。原作者：Alexandru Ciucă / RA2WEB。
-
-本仓库仅含构建脚本，不含也不分发游戏客户端代码与美术资源；脚本运行时从上游仓库与官方 CDN 获取。脚本本身以 GPL-3.0 授权（与上游一致）。
+- 本仓库脚本：GPL-3.0（与上游一致）
+- 上游客户端源自闭源商业产品 Chronodivide 的反编译重建，法律状态属灰色地带
+- 游戏美术与音频资源版权属 EA，仅限内网自用，请勿对外提供服务或用于商业用途
+- RA2Web 授权要求保留「网页红井 / RA2WEB」名称标识

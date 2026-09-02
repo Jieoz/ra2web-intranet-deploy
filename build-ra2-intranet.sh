@@ -6,7 +6,10 @@
 # 多人联机走游戏内置 LAN 模式（WebRTC P2P，iceServers=[]，无 STUN/TURN）。
 #
 # 用法：  bash build-ra2-intranet.sh [输出目录，默认 ./ra2-intranet]
-# 依赖：  git、node>=20（含 npm）、python3、curl、python3-pillow(可选,用于占位加载图)
+# 依赖：  git、python3、curl、tar
+#         node 不需要预装：版本不满足 vite 要求时脚本会自动下载便携版 Node，
+#         只在构建目录内使用，不碰系统 node、不需要 root。
+# 环境变量：RA2_FORCE_NODE=1  强制使用便携版 Node（忽略系统 node）
 set -euo pipefail
 
 OUT="${1:-./ra2-intranet}"
@@ -14,17 +17,82 @@ mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"   # 绝对化：脚本中途会 cd 进仓库，相对路径会算错
 REPO="$OUT/redalert2"
 WEBROOT="$OUT/webroot"
+TOOLS="$OUT/toolchain"
+NODE_LTS="v24.20.0"         # vite 8 / rolldown 需要 node ^20.19 || >=22.12
 UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
 echo "==> [1/7] 准备目录 $OUT"
-mkdir -p "$OUT"
 
-echo "==> [2/7] 克隆 huangkaoya/redalert2"
+echo "==> [2/7] 检查 Node 工具链"
+node_ok() {
+    command -v node >/dev/null 2>&1 || return 1
+    node -e 'const [a,b]=process.versions.node.split(".").map(Number);
+             process.exit((a===20&&b>=19)||a>=22 ? 0 : 1)' 2>/dev/null
+}
+if [ "${RA2_FORCE_NODE:-0}" != "1" ] && node_ok; then
+    echo "    系统 node $(node -v) 满足要求"
+else
+    if command -v node >/dev/null 2>&1; then
+        echo "    系统 node $(node -v) 版本过低（vite 8 需要 ^20.19 || >=22.12）"
+    else
+        echo "    未检测到 node"
+    fi
+    case "$(uname -m)" in
+        x86_64|amd64)  NARCH=x64 ;;
+        aarch64|arm64) NARCH=arm64 ;;
+        armv7l)        NARCH=armv7l ;;
+        *) echo "!! 不支持的 CPU 架构 $(uname -m)，请手动安装 node >= 22.12" >&2; exit 1 ;;
+    esac
+    mkdir -p "$TOOLS"
+    # 官方二进制需要 glibc >= 2.28；老系统（CentOS 7 等）回退到 unofficial-builds 的 glibc-2.17 变体
+    CANDIDATES=(
+        "https://nodejs.org/dist/${NODE_LTS}/node-${NODE_LTS}-linux-${NARCH}.tar.xz|node-${NODE_LTS}-linux-${NARCH}|官方"
+    )
+    if [ "$NARCH" = "x64" ]; then
+        CANDIDATES+=("https://unofficial-builds.nodejs.org/download/release/${NODE_LTS}/node-${NODE_LTS}-linux-x64-glibc-217.tar.xz|node-${NODE_LTS}-linux-x64-glibc-217|glibc-2.17 兼容版")
+    fi
+
+    NODE_READY=0
+    for entry in "${CANDIDATES[@]}"; do
+        URL="${entry%%|*}"; rest="${entry#*|}"; DIRNAME="${rest%%|*}"; LABEL="${rest##*|}"
+        NODE_DIR="$TOOLS/$DIRNAME"
+        if [ ! -x "$NODE_DIR/bin/node" ]; then
+            echo "    下载便携版 Node ${NODE_LTS} (${NARCH}, ${LABEL})"
+            if ! curl -fL --progress-bar -o "$TOOLS/node.tar.xz" "$URL"; then
+                echo "    下载失败，尝试下一个来源"
+                continue
+            fi
+            tar -xJf "$TOOLS/node.tar.xz" -C "$TOOLS" || { echo "    解压失败，尝试下一个来源"; continue; }
+            rm -f "$TOOLS/node.tar.xz"
+        fi
+        # 真正跑一次，确认二进制在本机能启动（glibc/架构不匹配会在这里暴露）
+        if "$NODE_DIR/bin/node" -v >/dev/null 2>&1; then
+            export PATH="$NODE_DIR/bin:$PATH"
+            hash -r
+            echo "    已切换到便携版 node $(node -v) (${LABEL})"
+            NODE_READY=1
+            break
+        fi
+        echo "    ${LABEL} 无法在本机运行（$("$NODE_DIR/bin/node" -v 2>&1 | head -1)）"
+        rm -rf "$NODE_DIR"
+    done
+
+    if [ "$NODE_READY" != "1" ]; then
+        echo "" >&2
+        echo "!! 无法自动准备可用的 Node。你的系统 glibc: $(ldd --version 2>&1 | head -1)" >&2
+        echo "   vite 8 需要 node ^20.19 || >=22.12，请手动安装后重跑，例如：" >&2
+        echo "     curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt install -y nodejs" >&2
+        echo "   或改用不需要 node 的预构建路线（见 README 路线 B）。" >&2
+        exit 1
+    fi
+fi
+
+echo "==> [3/7] 克隆 huangkaoya/redalert2"
 if [ ! -d "$REPO" ]; then
     git clone --depth 1 https://github.com/huangkaoya/redalert2.git "$REPO"
 fi
 
-echo "==> [3/7] 应用纯CDN模式补丁（rfs为空时不崩溃）"
+echo "==> [4/7] 应用纯CDN模式补丁（rfs为空时不崩溃）"
 cd "$REPO"
 python3 - <<'PYEOF'
 import pathlib, re, sys
@@ -41,15 +109,12 @@ if "this.rfs ? " in s:
 # 逐表达式替换，不依赖缩进/上下文，不重排代码块。
 # 目的：纯 CDN 模式下 this.rfs 为 undefined 时不抛 TypeError。
 subs = [
-    # 1) 类字段与构造参数改为可选
     (r"private\s+rfs:\s*RealFileSystem\s*;",
      "private rfs: RealFileSystem | undefined;"),
     (r"constructor\s*\(\s*rfs:\s*RealFileSystem\s*,",
      "constructor(rfs: RealFileSystem | undefined,"),
-    # 2) for await ... of this.rfs.getEntries()  ->  空迭代兜底
     (r"of\s+this\.rfs\.getEntries\(\)",
      "of (this.rfs ? this.rfs.getEntries() : [])"),
-    # 3) await this.rfs.openFile(X)  ->  三元兜底
     (r"await\s+this\.rfs\.openFile\(([A-Za-z_$][\w$]*)\)",
      r"(this.rfs ? await this.rfs.openFile(\1) : undefined)"),
 ]
@@ -71,7 +136,7 @@ p.write_text(s)
 print(f"    补丁应用成功（{guarded} 处 this.rfs 调用已加空值保护）")
 PYEOF
 
-echo "==> [4/7] 写入内网化配置"
+echo "==> [5/7] 写入内网化配置并构建"
 cat > public/config.ini <<'CFGEOF'
 [General]
 discordUrl=
@@ -105,15 +170,14 @@ apiRegUrl="http://localhost/register"
 wladderUrl="http://localhost/ladder"
 wgameresUrl="http://localhost/wgameres"
 SVCEOF
-
-echo "==> [5/7] npm 安装依赖并构建（纯 node，无需 bun）"
 npm ci --no-audit --no-fund
 node ./node_modules/vite/bin/vite.js build
+[ -d dist ] || { echo "!! 构建未产出 dist/" >&2; exit 1; }
 
 echo "==> [6/7] 拉取游戏资源（官方CDN, 187MB, 带UA与Referer）"
 RES="$WEBROOT/cdn/game-res/v2"
 mkdir -p "$RES"
-curl -s --max-time 60 -A "$UA" -o "$RES/manifest.json" "https://wyhjres.ra2web.cn/manifest.json"
+curl -fs --max-time 60 -A "$UA" -o "$RES/manifest.json" "https://wyhjres.ra2web.cn/manifest.json"
 python3 - "$RES" "$UA" <<'PYEOF'
 import json, subprocess, sys, zlib, os
 res_dir, ua = sys.argv[1], sys.argv[2]
@@ -123,17 +187,28 @@ for fn, crc in man["checksums"].items():
     dst = os.path.join(res_dir, fn)
     if os.path.exists(dst) and zlib.crc32(open(dst, "rb").read()) & 0xFFFFFFFF == crc:
         continue
-    need.append((fn, crc))
-for fn, crc in need:
-    subprocess.run(["curl", "-s", "--max-time", "300", "-A", ua,
-                    "-H", "Referer: https://game.ra2web.com/",
-                    "-o", os.path.join(res_dir, fn),
-                    f"https://wyhjres.ra2web.cn/{fn}"], check=True)
-# PNG 加载图官方已下架：有 pillow 就生成内网占位图并重写校验和
+    need.append(fn)
+failed = []
+for i, fn in enumerate(need, 1):
+    print(f"    [{i}/{len(need)}] {fn}", flush=True)
+    r = subprocess.run(["curl", "-fs", "--max-time", "600", "-A", ua,
+                        "-H", "Referer: https://game.ra2web.com/",
+                        "-o", os.path.join(res_dir, fn),
+                        f"https://wyhjres.ra2web.cn/{fn}"])
+    if r.returncode != 0:
+        # 官方已下架的加载图（*.png）下面会用占位图补上；其余资源才算真失败
+        failed.append(fn)
+        if not fn.lower().endswith(".png"):
+            print(f"!! 资源下载失败: {fn} (curl exit {r.returncode})", file=sys.stderr)
+            sys.exit(1)
+        print(f"        官方已下架，将用内网占位图替代")
+
+# PNG 加载图官方已下架：有 pillow 就生成内网占位图
 try:
     from PIL import Image, ImageDraw, ImageFont
     font = None
     for fp in ["/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+               "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]:
         try:
             font = ImageFont.truetype(fp, 42); break
@@ -153,13 +228,33 @@ try:
                     "korea":"韩国","obs":"观察者"}.items():
         make(f"{res_dir}/ls800{key}.png", cn, "正在加载战场数据...")
 except ImportError:
-    pass
+    print("    (未装 python3-pillow：加载图将用 1x1 纯色占位)")
+    import struct
+    def _png1(path, w=800, h=600, rgb=(16, 18, 24)):
+        def chunk(t, d):
+            c = t + d
+            return struct.pack(">I", len(d)) + c + struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
+        row = b"\x00" + bytes(rgb) * w
+        png = (b"\x89PNG\r\n\x1a\n"
+               + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+               + chunk(b"IDAT", zlib.compress(row * h))
+               + chunk(b"IEND", b""))
+        open(path, "wb").write(png)
+    for fn in [f for f in man["checksums"] if f.lower().endswith(".png")]:
+        dst = os.path.join(res_dir, fn)
+        if not os.path.exists(dst) or os.path.getsize(dst) == 0:
+            _png1(dst)
+
 # 全量重写校验和，保证包内自洽
+missing = [fn for fn in man["checksums"] if not os.path.exists(os.path.join(res_dir, fn))
+           or os.path.getsize(os.path.join(res_dir, fn)) == 0]
+if missing:
+    print("!! 缺失资源:", missing, file=sys.stderr); sys.exit(1)
 for fn in list(man["checksums"]):
     data = open(os.path.join(res_dir, fn), "rb").read()
     man["checksums"][fn] = zlib.crc32(data) & 0xFFFFFFFF
 json.dump(man, open(os.path.join(res_dir, "manifest.json"), "w"), indent=2)
-print("resources OK:", len(man["checksums"]), "files")
+print("    resources OK:", len(man["checksums"]), "files")
 PYEOF
 
 echo "==> [7/7] 同步构建产物到 webroot（保留 cdn/ 资源目录）"
@@ -174,3 +269,5 @@ echo "内网部署：把 webroot/ 整体拷到内网服务器，任意静态服�
 echo "  cd webroot && python3 -m http.server 8080 --bind 0.0.0.0"
 echo "玩家访问 http://<内网IP>:8080/ 关闭MOD导入弹窗即可进入主菜单。"
 echo "多人对战：主菜单 → 局域网(LAN) → 创建房间生成邀请码（同一内网互通）。"
+echo ""
+echo "注：toolchain/ 是构建期用的便携 Node，拷进内网时不需要，可删。"
