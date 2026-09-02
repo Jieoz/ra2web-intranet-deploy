@@ -1,190 +1,244 @@
 #!/usr/bin/env bash
-# fetch-ra2-resources.sh — 只拉游戏资源，配合预构建客户端使用
+# fetch-ra2-resources.sh — 拉取网页红警2运行所需的全部资源，配合预构建客户端使用
 #
 # 为什么单独一个脚本：客户端构建需要 node >= 20.19（vite 8 的硬性要求），
 # 而资源拉取只需要 python3 + curl。客户端已预先构建好（client/ 目录），
 # 所以运行本脚本的机器完全不需要 node。
 #
 # 用法：
-#   1) 解开 ra2web-client-dist.zip（或 .tar.gz），得到 client/ 目录
-#   2) bash fetch-ra2-resources.sh client
-#   3) 把 client/ 整体拷进内网，静态服务器托管
+#   bash fetch-ra2-resources.sh [客户端目录]     # 默认 ./client
 #
-# 走代理：直接 export http_proxy / https_proxy 即可，curl 自动继承。
-#
-# 依赖：python3、curl。可选 python3-pillow（画中文占位加载图，缺了就用纯色底图）
+# 可重复运行：已经就位且校验通过的文件会跳过，中断后重跑只补缺的部分。
+# 依赖：python3、curl
+
 set -euo pipefail
 
 WEBROOT="${1:-client}"
-[ -f "$WEBROOT/index.html" ] || { echo "!! $WEBROOT 里没有 index.html，路径不对？" >&2; exit 1; }
+[ -d "$WEBROOT" ] || { echo "!! 找不到客户端目录：$WEBROOT" >&2; exit 1; }
+[ -f "$WEBROOT/index.html" ] || { echo "!! $WEBROOT 里没有 index.html，不像是客户端目录" >&2; exit 1; }
+WEBROOT="$(cd "$WEBROOT" && pwd)"
 
-RES="$WEBROOT/cdn/game-res/v2"
-# 清空 MOD 远端清单：上游 mods.ini 里的 Download/Website 全是外网地址
-printf '[General]\n' > "$WEBROOT/mods.ini"
-UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+command -v python3 >/dev/null || { echo "!! 需要 python3" >&2; exit 1; }
+command -v curl    >/dev/null || { echo "!! 需要 curl" >&2; exit 1; }
 
-echo "==> 拉取游戏资源到 $RES （约 187MB，断点续跑：已下载且校验通过的会跳过）"
-mkdir -p "$RES"
-curl -fsS --retry 3 --retry-delay 2 --max-time 60 -A "$UA" \
-     -o "$RES/manifest.official.json" "https://wyhjres.ra2web.cn/manifest.json"
+echo "==> 拉取游戏资源到 $WEBROOT"
 
-python3 - "$RES" "$UA" <<'PYEOF'
-import json, os, subprocess, sys, zlib
+WEBROOT="$WEBROOT" python3 <<'PYEOF'
+import os, re, subprocess, sys, struct, zlib, json
 
-res_dir, ua = sys.argv[1], sys.argv[2]
+webroot  = os.environ["WEBROOT"]
+res_dir  = os.path.join(webroot, "cdn", "game-res", "v2")
+ls_dir   = os.path.join(res_dir, "ls")
+maps_dir = os.path.join(webroot, "cdn", "maps")
+for d in (res_dir, ls_dir, maps_dir):
+    os.makedirs(d, exist_ok=True)
 
-# 官方清单单独留一份：本地 manifest.json 里占位图的校验和会被改写，
-# 不能拿改写后的值当校验基准（否则损坏文件也能"校验通过"）。
-official = json.load(open(os.path.join(res_dir, "manifest.official.json")))
-checksums = official["checksums"]
+RES_BASE = "https://wyhjres.ra2web.cn/"
+MAP_BASE = "https://gameres.chronodivide.com/map/"
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+REFERER = "https://game.ra2web.com/"
+
+def curl(url, dst, timeout=180):
+    """下载到 dst。返回 True 表示 curl 认为成功（内容是否可用由调用方校验）。"""
+    r = subprocess.run(
+        ["curl", "-sS", "-f", "--max-time", str(timeout),
+         "-A", UA, "-e", REFERER, "-o", dst, url],
+        capture_output=True, text=True)
+    return r.returncode == 0
 
 def crc(path):
-    h = 0
     with open(path, "rb") as f:
-        while True:
-            b = f.read(1 << 20)
-            if not b:
-                return h & 0xFFFFFFFF
-            h = zlib.crc32(b, h)
+        return zlib.crc32(f.read()) & 0xFFFFFFFF
 
-# 上一轮跑出来的本地清单：占位图的 CRC 与官方不同，靠它认出"这张图是我自己生成的"，
-# 否则每次重跑都会对着已下架的 URL 再试一遍。
-prev_path = os.path.join(res_dir, "manifest.json")
-prev = {}
-if os.path.exists(prev_path):
-    try:
-        prev = json.load(open(prev_path)).get("checksums", {})
-    except Exception:
-        prev = {}
-
-placeholders = []   # 官方已下架 / 拉不到，用本地生成的图替代
-
-def ok(fn):
-    """本地文件是否已就位：与官方一致，或是上一轮生成的占位图"""
-    p = os.path.join(res_dir, fn)
-    if not os.path.exists(p) or os.path.getsize(p) == 0:
-        return False
-    c = crc(p)
-    if c == checksums[fn]:
-        return True
-    if fn.lower().endswith(".png") and prev.get(fn) == c:
-        placeholders.append(fn)   # 沿用上一轮的占位图
-        return True
-    return False
-
-need = [fn for fn in checksums if not ok(fn)]
-
-if not need:
-    print("    全部 %d 项资源已就位，无需下载" % len(checksums))
-
-for i, fn in enumerate(need, 1):
-    print(f"    [{i}/{len(need)}] {fn}", flush=True)
-    dst = os.path.join(res_dir, fn)
-    r = subprocess.run(["curl", "-fsS", "--retry", "3", "--retry-delay", "2",
-                        "--max-time", "900", "-A", ua,
-                        "-H", "Referer: https://game.ra2web.com/",
-                        "-o", dst, f"https://wyhjres.ra2web.cn/{fn}"])
-    bad = None
-    if r.returncode != 0:
-        bad = f"下载失败 (curl exit {r.returncode})"
-    elif not os.path.exists(dst) or os.path.getsize(dst) == 0:
-        bad = "文件为空"
-    elif crc(dst) != checksums[fn]:
-        # 关键：下载完必须比对官方 CRC。反盗链会返回 HTML 伪装页，
-        # 代理/网络中断会返回截断文件，两者都是"下载成功"但内容是坏的。
-        bad = "内容校验不通过（可能是反盗链页面或传输截断）"
-
-    if not bad:
-        continue
-    if fn.lower().endswith(".png"):
-        # 官方已下架 10 张阵营加载图 + glsl.png，只是加载画面装饰，可本地替代
-        print(f"        {bad} → 用内网占位图替代")
-        placeholders.append(fn)
-        if os.path.exists(dst):
-            os.remove(dst)
-    else:
-        # .mix 是引擎必需的游戏数据，绝不能拿坏文件糊过去
-        print(f"!! 资源不可用: {fn} — {bad}", file=sys.stderr)
-        print("   若在受限网络下，先 export https_proxy=... 再重跑本脚本。", file=sys.stderr)
-        sys.exit(1)
-
-# ---- 生成占位加载图 ----
-def solid_png(path, w=800, h=600, rgb=(16, 18, 24)):
-    import struct
-    def chunk(t, d):
-        c = t + d
-        return struct.pack(">I", len(d)) + c + struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
-    row = b"\x00" + bytes(rgb) * w
-    open(path, "wb").write(
-        b"\x89PNG\r\n\x1a\n"
-        + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
-        + chunk(b"IDAT", zlib.compress(row * h))
-        + chunk(b"IEND", b""))
-
-labels = {"ustates": "美国", "france": "法国", "germany": "德国", "ukingdom": "英国",
-          "russia": "俄罗斯", "cuba": "古巴", "libya": "利比亚", "iraq": "伊拉克",
-          "korea": "韩国", "obs": "观察者"}
-
-if placeholders:
-    try:
-        from PIL import Image, ImageDraw, ImageFont
-        font = None
-        for fp in ["/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-                   "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
-                   "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]:
-            try:
-                font = ImageFont.truetype(fp, 42); break
-            except Exception:
-                pass
-        def make(path, l1, l2):
-            img = Image.new("RGB", (800, 600), (16, 18, 24))
-            d = ImageDraw.Draw(img)
-            d.rectangle([8, 8, 791, 591], outline=(70, 130, 60), width=3)
-            if font:
-                d.text((400, 270), l1, fill=(220, 220, 210), font=font, anchor="mm")
-                d.text((400, 330), l2, fill=(150, 150, 140), font=font, anchor="mm")
-            img.save(path, "PNG")
-        for fn in placeholders:
-            dst = os.path.join(res_dir, fn)
-            if fn == "glsl.png":
-                make(dst, "红警 2 网页版", "内网离线部署版")
-            else:
-                make(dst, labels.get(fn[5:-4], fn[5:-4]), "正在加载战场数据...")
-    except ImportError:
-        print("    (未装 python3-pillow：加载图用纯色底图占位)")
-        for fn in placeholders:
-            solid_png(os.path.join(res_dir, fn))
-
-# ---- 最终验收：逐项分类核对 ----
-local = dict(checksums)
-errs = []
-for fn in checksums:
-    p = os.path.join(res_dir, fn)
-    if not os.path.exists(p) or os.path.getsize(p) == 0:
-        errs.append(f"{fn}: 缺失")
-        continue
-    c = crc(p)
-    if c == checksums[fn]:
-        continue
-    if fn in placeholders:
-        local[fn] = c          # 占位图：允许与官方不同，写入本地清单保持包内自洽
-    else:
-        errs.append(f"{fn}: CRC 不符（本地 {c} != 官方 {checksums[fn]}）")
-
-if errs:
-    print("!! 资源校验失败：", file=sys.stderr)
-    for e in errs:
-        print("   -", e, file=sys.stderr)
+# ---------------------------------------------------------------- 引擎资源
+# 官方清单原样落盘。客户端对 .mix 会用清单里的 CRC 做强校验（CdnResourceLoader
+# 附加 ?h=<crc> 并比对），所以清单绝不能被改写——改写等于把校验关掉。
+manifest_path = os.path.join(res_dir, "manifest.json")
+if not curl(RES_BASE + "manifest.json", manifest_path):
+    print("!! 拉取资源清单失败（manifest.json）", file=sys.stderr)
     sys.exit(1)
 
-official["checksums"] = local
-json.dump(official, open(os.path.join(res_dir, "manifest.json"), "w"), indent=2)
-os.remove(os.path.join(res_dir, "manifest.official.json"))
+with open(manifest_path, encoding="utf-8") as f:
+    checksums = json.load(f)["checksums"]
 
-total = sum(os.path.getsize(os.path.join(res_dir, f)) for f in local)
-real = len(local) - len(placeholders)
-print("    资源就绪：%d 项 / %.1f MB —— %d 项与官方 CRC 逐字节一致，%d 项为本地占位图"
-      % (len(local), total / 1048576, real, len(placeholders)))
+def remote_and_local(fn):
+    """加载图在 CDN 的 ls/ 子目录下，客户端也按 ls/<name> 请求（LoadingScreenWrapper
+    直接用 <img src=cdnBase+"ls/"+name>，不走 CRC 校验的下载器）。其余在根。"""
+    if fn.startswith("ls800"):
+        return RES_BASE + "ls/" + fn, os.path.join(ls_dir, fn)
+    return RES_BASE + fn, os.path.join(res_dir, fn)
+
+def content_ok(fn, path, want):
+    """校验下载内容。反盗链页面和截断文件都是 HTTP 200 + curl 退出码 0，
+    只有比对内容才能挡下来。"""
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return False
+    if fn.endswith(".png"):
+        # 上游 manifest 对 glsl.png / ls800russia.png 的 CRC 与自家 CDN 上的
+        # 文件就是不一致的，而客户端对图片本来也不校验 CRC，所以只验 PNG 头。
+        with open(path, "rb") as f:
+            return f.read(8) == b"\x89PNG\r\n\x1a\n"
+    return crc(path) == (want & 0xFFFFFFFF)
+
+print("--> 引擎资源 %d 项" % len(checksums))
+todo = []
+for fn, want in checksums.items():
+    _, dst = remote_and_local(fn)
+    if not content_ok(fn, dst, want):
+        todo.append(fn)
+
+if todo:
+    for i, fn in enumerate(sorted(todo), 1):
+        url, dst = remote_and_local(fn)
+        want = checksums[fn]
+        for attempt in (1, 2, 3):
+            ok = curl(url, dst) and content_ok(fn, dst, want)
+            if ok:
+                break
+            if attempt < 3:
+                print("    [%d/%d] %s 第 %d 次失败，重试" % (i, len(todo), fn, attempt))
+        else:
+            print("!! 资源不可用: %s（内容校验不通过，可能是反盗链页面或传输截断）" % fn,
+                  file=sys.stderr)
+            sys.exit(1)
+        print("    [%d/%d] %s" % (i, len(todo), fn))
+else:
+    print("    全部 %d 项已就位，无需下载" % len(checksums))
+
+total = 0
+for fn in checksums:
+    _, dst = remote_and_local(fn)
+    total += os.path.getsize(dst)
+mix_ok = sum(1 for fn, w in checksums.items()
+             if not fn.endswith(".png") and content_ok(fn, remote_and_local(fn)[1], w))
+print("    引擎资源就绪：%d 项 / %.1f MB（其中 %d 项 .mix/.mp4 与官方 CRC 逐字节一致）"
+      % (len(checksums), total / 1048576, mix_ok))
+
+# ------------------------------------------------------------------ 地图
+# 地图是独立的第二套资源，不在 manifest.json 里。客户端进遭遇战/局域网时
+# 按需去 mapsBaseUrl 取 .map，取不到就弹"下载失败，请检查网络连接"。
+# 地图清单藏在 ini.mix 里的 missions.pkt。
+
+def _crc_table():
+    t = []
+    for i in range(256):
+        c = i
+        for _ in range(8):
+            c = (0xEDB88320 ^ (c >> 1)) if (c & 1) else (c >> 1)
+        t.append(c)
+    return t
+
+_CRC_T = _crc_table()
+
+def crc32_ww(data):
+    """引擎用的 CRC32（等价 zlib.crc32，显式实现便于对照源码）。"""
+    c = 0xFFFFFFFF
+    for b in data:
+        c = ((c >> 8) ^ _CRC_T[(c & 0xFF) ^ b]) & 0xFFFFFFFF
+    return (c ^ 0xFFFFFFFF) & 0xFFFFFFFF
+
+def mix_hash(name):
+    """复刻引擎的 MixEntry.hashFilename：大写 + 补齐到 4 字节倍数的诡异规则。
+    末尾不足 4 字节时先追加一个"已满块数"字符，再用该位置的字符重复填满。"""
+    s = name.upper()
+    n = len(s)
+    r = n >> 2
+    if n & 3:
+        s += chr(n - (r << 2))
+        pad_n = 3 - (n & 3)
+        idx = r << 2
+        ch = s[idx] if idx < len(s) else s[0]
+        s += ch * pad_n
+    return crc32_ww(bytes(ord(c) & 0xFF for c in s))
+
+def mix_entries(path):
+    """最小 MIX 解析：返回 (data, {hash: (offset, size)})。只支持未加密归档。
+
+    头部布局易错：可选 4 字节 flags，随后条目数是 uint16、数据区大小是 uint32,
+    合计 6 字节——不是两个 uint32。按 8 字节算会把索引起点偏移 2 字节，
+    表现为解析到一半 unpack 越界。
+    """
+    with open(path, "rb") as f:
+        data = f.read()
+    flags = struct.unpack_from("<I", data, 0)[0]
+    if (flags & ~0x30000) == 0:
+        if flags & 0x20000:
+            raise NotImplementedError("encrypted MIX not supported: " + path)
+        pos = 4
+    else:
+        pos = 0
+    count = struct.unpack_from("<H", data, pos)[0]
+    pos += 6                       # count(2) + datasize(4)
+    body = pos + count * 12
+    out = {}
+    for _ in range(count):
+        h, off, size = struct.unpack_from("<III", data, pos)
+        pos += 12
+        out[h & 0xFFFFFFFF] = (body + off, size)
+    return data, out
+
+def mix_get(path, name):
+    data, entries = mix_entries(path)
+    hit = entries.get(mix_hash(name))
+    if not hit:
+        return None
+    off, size = hit
+    return data[off:off + size]
+
+pkt = mix_get(os.path.join(res_dir, "ini.mix"), "missions.pkt")
+if not pkt:
+    print("!! 无法从 ini.mix 取出 missions.pkt，跳过地图（进遭遇战会报下载失败）",
+          file=sys.stderr)
+    sys.exit(1)
+
+# missions.pkt 是 INI：[MultiMaps] 之外每个小节是一张地图
+maps, cur = [], None
+for line in pkt.decode("latin-1").splitlines():
+    s = line.strip()
+    if not s or s.startswith(";"):
+        continue
+    if s.startswith("[") and s.endswith("]"):
+        cur = s[1:-1].lower()
+        if cur != "multimaps":
+            maps.append(cur + ".map")
+
+print("--> 地图 %d 张（清单来自 ini.mix/missions.pkt）" % len(maps))
+have = miss = 0
+missing = []
+for i, fn in enumerate(maps, 1):
+    dst = os.path.join(maps_dir, fn)
+    # 地图是 INI 文本。别用"首字节必须是 ["：tn01t2.map 开头是裸 key=value，
+    # 小节头在后面几行，卡首字节会把好文件误判成坏的。
+    if os.path.exists(dst) and os.path.getsize(dst) > 4096:
+        have += 1
+        continue
+    ok = False
+    for attempt in (1, 2):
+        if curl(MAP_BASE + fn, dst, timeout=60) and os.path.getsize(dst) > 4096:
+            head = open(dst, "rb").read(2048).lstrip()
+            if b"[" in head and b"<html" not in head[:200].lower():
+                ok = True
+                break
+    if ok:
+        have += 1
+    else:
+        miss += 1
+        missing.append(fn)
+        if os.path.exists(dst):
+            os.remove(dst)
+
+size = sum(os.path.getsize(os.path.join(maps_dir, f))
+           for f in os.listdir(maps_dir)) / 1048576
+print("    地图就绪：%d 张 / %.1f MB" % (have, size))
+if missing:
+    print("    另有 %d 张官方 CDN 未提供（战役合作图，多人对战不受影响）" % miss)
+
+# 客户端启动时会拉这个页面填公告位，缺了会在控制台报 404
+news = os.path.join(webroot, "breaking-news.html")
+if not os.path.exists(news):
+    with open(news, "w", encoding="utf-8") as f:
+        f.write('<!doctype html><meta charset="utf-8"><title>news</title>\n')
 PYEOF
 
 SIZE=$(du -sh "$WEBROOT" | cut -f1)
@@ -193,5 +247,5 @@ echo "✅ 完成：$WEBROOT ($SIZE) —— 这个目录整体拷进内网即可"
 echo ""
 echo "内网托管："
 echo "  cd $WEBROOT && python3 -m http.server 8080 --bind 0.0.0.0"
-echo "玩家访问 http://<内网IP>:8080/ 关闭MOD导入弹窗即进主菜单。"
+echo "玩家访问 http://<内网IP>:8080/ 关闭 MOD 导入弹窗即进主菜单。"
 echo "多人对战：主菜单 → 局域网(LAN) → 创建房间生成邀请码（同一内网互通）。"

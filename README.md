@@ -14,7 +14,7 @@
 
 ### 路线 A：现成站点包（最省事）
 
-Release 里的 `ra2web-intranet-site.tar.gz` 是完整成品站点（约 90MB 压缩 / 197MB 解压后），资源已就位，解压即可托管：
+Release 里的 `ra2web-intranet-site.tar.gz` 是完整成品站点（约 100MB 压缩 / 200MB 解压后），引擎资源与 62 张多人地图都已就位，解压即可托管：
 
 ```bash
 tar -xzf ra2web-intranet-site.tar.gz
@@ -55,7 +55,7 @@ bash fetch-ra2-resources.sh <客户端目录>
 
 **受限网络**：脚本走 `curl`，直接 `export https_proxy=http://host:port` 即可继承。
 
-**断点续跑**：已下载且 CRC 与官方一致的文件跳过，上一轮生成的占位图也会被识别并沿用，中断后重跑只补缺的。
+**断点续跑**：已下载且内容校验通过的文件跳过，中断后重跑只补缺的。
 
 ## 内网部署
 
@@ -73,11 +73,17 @@ cd webroot && python3 -m http.server 8080 --bind 0.0.0.0
 
 2. **清空所有外网引用** — `config.ini` 里的资源包下载地址、更新公告、排行榜规则、mod SDK、Discord 链接全部置空；`servers.ini` 只留一个不可用的占位 LAN 条目，摘掉官方对战服（`wolUrl` 指向 k0s.cn / wangerhuoda.cn）。全仓唯一剩余硬编码外链是 Sentry，而不配置 `[Sentry]` 段就不会加载。
 
-3. **资源本地化** — 按官方 `manifest.json` 逐项拉取 33 个资源文件（约 187MB）。官方 CDN 有 UA / Referer 反盗链，脚本带上对应请求头。
+3. **资源本地化** — 按官方 `manifest.json` 逐项拉取 33 个引擎资源（约 187MB）。官方 CDN 有 UA / Referer 反盗链，脚本带上对应请求头。
 
-   每个文件下载后都比对官方 CRC32 才算通过——反盗链会返回 HTTP 200 的 HTML 伪装页，代理或网络中断会返回截断文件，两者都是「curl 退出码 0」但内容是坏的。`.mix` 游戏数据校验不通过直接退出并报明原因，绝不拿坏文件糊过去。
+   `.mix` / `.mp4` 下载后比对官方 CRC32 才算通过——反盗链会返回 HTTP 200 的 HTML 伪装页，代理或网络中断会返回截断文件，两者都是「curl 退出码 0」但内容是坏的。校验不通过重试 3 次后直接退出并报明原因，绝不拿坏文件糊过去。
 
-   其中 10 张阵营加载图 + `glsl.png` 官方已下架（404），这些只是加载画面装饰，脚本生成内网占位图替代（装了 `python3-pillow` 就画中文标题，否则纯色底图），并只对这几项重写校验和保证包内自洽。完成时会分别报告「N 项与官方逐字节一致 / M 项为本地占位图」。
+   **路径不是扁平的**：`manifest.json` 里 10 张阵营加载图（`ls800*.png`）的键是裸文件名，但 CDN 上它们在 `ls/` 子目录下，客户端也按 `<cdn>/ls/<name>` 请求（`LoadingScreenWrapper.tsx` 直接 `<img src>`，不走校验下载器）。按键名扁平拼 URL 会全部 404。`glsl.png` 反而在根目录。
+
+   图片只验 PNG magic，不验 CRC：上游 manifest 对 `glsl.png` 和 `ls800russia.png` 的校验和与它自家 CDN 上的文件本来就不一致，而客户端对图片也不做校验。清单原样落盘，不重写。
+
+4. **地图本地化** — 地图是**独立的第二套资源**，不在 `manifest.json` 里。客户端进遭遇战 / 局域网时按需去 `mapsBaseUrl` 取 `.map`，取不到就弹「下载失败，请检查网络连接」（`TXT_DOWNLOAD_FAILED`，来自游戏原版 `general.csf`，不在客户端 locale JSON 里）。
+
+   地图清单藏在 `ini.mix` 内的 `missions.pkt`，脚本内置 MIX 解析器（复刻 `MixEntry.hashFilename` 那套大写 + 4 字节补齐的哈希规则）把它取出来，共 137 张。其中 62 张多人对战地图可从官方地图服务器拉到（约 12MB），75 张战役合作地图（`c1m1a` ~ `c5m5c`）官方已下架，全部 404 —— 不影响多人对战。
 
 ## 运行期外网依赖
 
