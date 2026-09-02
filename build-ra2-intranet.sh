@@ -160,6 +160,10 @@ unrankedQueueEnabled=no
 viewport.width=1024
 viewport.height=768
 CFGEOF
+# 清空 MOD 远端清单：上游 mods.ini 里的 Download/Website 全是外网地址（k0s.cn、download.ra2web.com 等）
+cat > public/mods.ini <<'MODEOF'
+[General]
+MODEOF
 cat > public/servers.ini <<'SVCEOF'
 [lan]
 label="内网 LAN 对战"

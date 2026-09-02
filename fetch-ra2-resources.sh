@@ -17,6 +17,8 @@ WEBROOT="${1:-client}"
 [ -f "$WEBROOT/index.html" ] || { echo "!! $WEBROOT 里没有 index.html，路径不对？" >&2; exit 1; }
 
 RES="$WEBROOT/cdn/game-res/v2"
+# 清空 MOD 远端清单：上游 mods.ini 里的 Download/Website 全是外网地址
+printf '[General]\n' > "$WEBROOT/mods.ini"
 UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
 echo "==> 拉取游戏资源到 $RES （约 187MB，断点续跑：已下载且校验通过的会跳过）"
