@@ -3,7 +3,8 @@
 #
 # 用途：在有外网的机器上执行一次，产出可整体拷入内网的纯静态站点 webroot/。
 # 之后内网任意静态文件服务器托管即可，运行期零外网依赖。
-# 多人联机走游戏内置 LAN 模式（WebRTC P2P，iceServers=[]，无 STUN/TURN）。
+# 多人联机走游戏内置 LAN 模式（WebRTC P2P）。跨机器对战需要一个内网 STUN，
+# 脚本会把上游写死的 iceServers=[] 改成可自动推导，配套 ministun.py 即可，仍零外网。
 #
 # 用法：  bash build-ra2-intranet.sh [输出目录，默认 ./ra2-intranet]
 # 依赖：  git、python3、curl、tar
