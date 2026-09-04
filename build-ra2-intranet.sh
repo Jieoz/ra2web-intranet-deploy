@@ -24,6 +24,11 @@ NODE_LTS="v24.20.0"         # vite 8 / rolldown 需要 node ^20.19 || >=22.12
 UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
 echo "==> [1/7] 准备目录 $OUT"
+# webroot 必须在这里建。它曾经是靠 [7/7] 资源拉取里 mkdir -p "$WEBROOT/cdn/..."
+# 的副作用产生的，后来资源拉取被抽成独立脚本、执行顺序调到同步产物之后，
+# 那个副作用就没了 —— 于是全新目录跑到 [6/7] 的 find "$WEBROOT" 直接失败。
+# 目录创建属于"准备目录"这一步的职责，不该寄生在别的步骤里。
+mkdir -p "$WEBROOT"
 
 echo "==> [2/7] 检查 Node 工具链"
 node_ok() {
@@ -472,13 +477,24 @@ MODEOF
 # 内网 LAN 对战走 WebRTC，完全不读它。之前这里生成过一份带 wolUrl/apiRegUrl 的
 # 占位文件，实测其中每个键在客户端里都没有任何读取方 —— 纯摆设，删掉避免误导。
 rm -f public/servers.ini
-npm ci --no-audit --no-fund
+# npm 缓存放在输出目录内，不用调用者的 ~/.npm：共享机器上那个目录常有别的用户
+# （或 root 跑过的 npx）留下的文件，npm ci 会以 EACCES 失败，而报错文本指向
+# registry 抓取失败，很容易误判成网络问题。
+npm ci --no-audit --no-fund --cache "$OUT/.npmcache"
 node ./node_modules/vite/bin/vite.js build
 [ -d dist ] || { echo "!! 构建未产出 dist/" >&2; exit 1; }
 
 echo "==> [6/7] 同步构建产物到 webroot"
+# 目录在 [1/7] 就建好了；这里再确认一次，缺了就是流程被改坏了，早报错好过
+# 让 find 抛一句看不懂的 "No such file or directory" 然后 set -e 静默中止。
+[ -d "$WEBROOT" ] || { echo "!! $WEBROOT 不存在（[1/7] 应已创建）" >&2; exit 1; }
 find "$WEBROOT" -mindepth 1 -maxdepth 1 ! -name cdn -exec rm -rf {} +
 cp -r "$REPO/dist/." "$WEBROOT/"
+# 产出自检：这几个是客户端启动必读的文件，缺任何一个都进不了主菜单。
+for f in index.html config.ini mods.ini general.csf ini.mix; do
+    [ -s "$WEBROOT/$f" ] || { echo "!! webroot 缺少 $f" >&2; exit 1; }
+done
+[ -d "$WEBROOT/assets" ] || { echo "!! webroot 缺少 assets/" >&2; exit 1; }
 
 echo "==> [7/7] 拉取游戏资源（官方CDN, 187MB）"
 # 资源拉取逻辑只有一份实现：fetch-ra2-resources.sh。
