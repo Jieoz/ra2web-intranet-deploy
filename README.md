@@ -63,17 +63,72 @@ bash fetch-ra2-resources.sh <客户端目录>
 cd webroot && python3 -m http.server 8080 --bind 0.0.0.0
 ```
 
-玩家浏览器访问 `http://<内网IP>:8080/`，关掉 MOD 导入弹窗即进主菜单。多人对战走**主菜单 → 局域网(LAN) → 创建房间**生成邀请码，同一内网互通。
+玩家浏览器访问 `http://<内网IP>:8080/`，关掉 MOD 导入弹窗即进主菜单。
 
 生产环境建议换 nginx / caddy，别用 `http.server`（单线程、无并发）。
+
+### 多人对战：必须配内网 STUN
+
+主菜单 → **局域网联机** → 创建房间，把邀请码（二维码或文本）给对方即可。信令
+不经服务器，靠玩家自己传递。
+
+**但只做到这一步，跨机器多半连不上。** 现代浏览器默认用 mDNS 假名
+（`<uuid>.local`）替代真实内网 IP 上报 ICE host candidate，实测一台机器采集到的
+候选只有一条：
+
+```
+a=candidate:... 09cd5807-...-9407d07729a1.local 51158 typ host
+```
+
+对端要解析这个名字得靠 mDNS 广播（UDP 5353），交换机 / AP 的客户端隔离经常把它
+丢掉。表现是**同一台机器开两个标签页能连，两台机器连不上**。上游客户端自己的
+`SdpCandidateDiagnostics.ts` 就为这个组合准备了警告文案，原话是「跨机器局域网很
+容易因为 mDNS/UDP 被拦而失败」。
+
+解法是给它一个内网 STUN 服务器。浏览器会额外采集 srflx 候选，内容正是自己的真实
+内网 IP:端口，直连即可成立 —— 且请求只发到你自己的内网地址，不出网。
+
+仓库自带 `ministun.py`（纯标准库，约 70 行，只实现 STUN Binding，不做 TURN 中继）：
+
+```bash
+python3 ministun.py 0.0.0.0 3478          # 在托管站点的那台机器上跑
+```
+
+> STUN Binding 协议本身不带认证，任何人发请求都会得到回应。这个端口只放在可信
+> 内网，**别把 3478/udp 映射到公网** —— 源 IP 可伪造，公网开放 STUN 会被当作 UDP
+> 反射放大源。能指定内网网卡地址就别用 `0.0.0.0`。
+
+然后在 `webroot/config.ini` 里填上它的地址（改完刷新页面即可，**不用重新构建**）：
+
+```ini
+lanStunUrl=stun:192.168.1.10:3478
+```
+
+配置前后的实测对比：
+
+| | 候选数 | 内容 | 跨机器 |
+|---|---|---|---|
+| `lanStunUrl=` 留空 | 1 | 仅 `*.local` | 很可能失败 |
+| 配上内网 STUN | 2 | 多一条 `172.19.0.33 typ srflx` | 可直连 |
+
+若内网禁 UDP 3478，换个端口即可（`ministun.py 0.0.0.0 19302`，配置里同步改）。
+
+> 另外：本项目**不生成 `servers.ini`**。那是官方战网登录（`LoginScreen` /
+> `WolService`）读的服务器列表，局域网对战走 WebRTC，完全不碰它。早期版本这里
+> 写过一份带 `wolUrl` / `apiRegUrl` 的占位文件，实测其中每个键在客户端里都没有
+> 任何读取方，纯属摆设，已删除。
 
 ## 脚本做了什么
 
 1. **纯 CDN 模式补丁** — 上游 `VirtualFileSystem.ts` 假定用户会通过浏览器 File System Access API 授予本地 RA2 安装目录（`this.rfs`）。内网纯 CDN 模式下没有这个句柄，`this.rfs` 为 `undefined` 会抛 `TypeError`。脚本给 5 处调用加空值保护，用正则按表达式替换而非上下文 diff，因此对上游缩进变动不敏感，且幂等（重复运行会跳过）。
 
-2. **清空所有外网引用** — `config.ini` 里的资源包下载地址、更新公告、排行榜规则、mod SDK、Discord 链接全部置空；`servers.ini` 只留一个不可用的占位 LAN 条目，摘掉官方对战服（`wolUrl` 指向 k0s.cn / wangerhuoda.cn）。全仓唯一剩余硬编码外链是 Sentry，而不配置 `[Sentry]` 段就不会加载。
+2. **清空所有外网引用** — `config.ini` 里的资源包下载地址、更新公告、排行榜规则、mod SDK、Discord 链接全部置空；`mods.ini` 的远端 MOD 清单清空（上游那份的 Download / Website 全指向 k0s.cn 等外网）。全仓唯一剩余硬编码外链是 Sentry，而不配置 `[Sentry]` 段就不会加载。官方对战服不需要专门摘除——局域网对战走 WebRTC，客户端这个版本压根不读服务器列表（见上文 `servers.ini` 注）。
 
-3. **资源本地化** — 按官方 `manifest.json` 逐项拉取 33 个引擎资源（约 187MB）。官方 CDN 有 UA / Referer 反盗链，脚本带上对应请求头。
+3. **局域网 ICE 可配置** — 上游两处 `RTCPeerConnection` 把 `iceServers` 写死成 `[]`。补丁给 `Config.ts` 加 `lanStunUrl` getter，`Application.ts` 在 config 加载完成后把算好的列表发布到 `globalThis.__ra2LanIceServers`，两处构造点改读它。**默认空值即上游行为**，`config.ini` 不填就完全不变。附带生成 `src/ra2-lan-ice.d.ts` 声明该全局，避免 `tsc` 报错。
+
+4. **静态资源修复** — `main-legacy.css` 里 `url(res/img/...)` 是相对路径，而 CSS 自己在 `/css/` 下，浏览器解析成 `/css/res/img/...` 全部 404，改为绝对路径；同一份 CSS 引用的 `cd-logo.png` 上游 `public/res/img/` 里根本不存在（只有 `download-arrow` / `drag-*`），去掉那条 `background` 简写里的 `url()`；`index.html` 的 favicon 指向 Vite 模板残留的 `/vite.svg`，换成内联 `data:` URI —— 单纯删掉 `<link>` 是不够的，那样浏览器会自己去请求 `/favicon.ico`，日志里照样一条 404。
+
+5. **资源本地化** — 按官方 `manifest.json` 逐项拉取 33 个引擎资源（约 187MB）。官方 CDN 有 UA / Referer 反盗链，脚本带上对应请求头。
 
    `.mix` / `.mp4` 下载后比对官方 CRC32 才算通过——反盗链会返回 HTTP 200 的 HTML 伪装页，代理或网络中断会返回截断文件，两者都是「curl 退出码 0」但内容是坏的。校验不通过重试 3 次后直接退出并报明原因，绝不拿坏文件糊过去。
 
@@ -81,7 +136,7 @@ cd webroot && python3 -m http.server 8080 --bind 0.0.0.0
 
    图片只验 PNG magic，不验 CRC：上游 manifest 对 `glsl.png` 和 `ls800russia.png` 的校验和与它自家 CDN 上的文件本来就不一致，而客户端对图片也不做校验。清单原样落盘，不重写。
 
-4. **地图本地化** — 地图是**独立的第二套资源**，不在 `manifest.json` 里。客户端进遭遇战 / 局域网时按需去 `mapsBaseUrl` 取 `.map`，取不到就弹「下载失败，请检查网络连接」（`TXT_DOWNLOAD_FAILED`，来自游戏原版 `general.csf`，不在客户端 locale JSON 里）。
+6. **地图本地化** — 地图是**独立的第二套资源**，不在 `manifest.json` 里。客户端进遭遇战 / 局域网时按需去 `mapsBaseUrl` 取 `.map`，取不到就弹「下载失败，请检查网络连接」（`TXT_DOWNLOAD_FAILED`，来自游戏原版 `general.csf`，不在客户端 locale JSON 里）。
 
    地图清单藏在 `ini.mix` 内的 `missions.pkt`，脚本内置 MIX 解析器（复刻 `MixEntry.hashFilename` 那套大写 + 4 字节补齐的哈希规则）把它取出来，共 137 张。其中 62 张多人对战地图可从官方地图服务器拉到（约 12MB），75 张战役合作地图（`c1m1a` ~ `c5m5c`）官方已下架，全部 404 —— 不影响多人对战。
 
@@ -89,7 +144,7 @@ cd webroot && python3 -m http.server 8080 --bind 0.0.0.0
 
 零。构建完成后 `webroot/` 内所有资源路径都是站点内相对路径，断网可完整运行单人遭遇战与局域网对战。
 
-局域网联机走上游内置的 WebRTC mesh（`src/network/lan/`），`RTCPeerConnection` 配置为 `iceServers: []`，不依赖任何 STUN / TURN 服务器，信令通过二维码或手动交换 SDP 完成——因此在完全隔离的内网里也能建立连接。
+局域网联机走上游内置的 WebRTC mesh（`src/network/lan/`），信令通过二维码或手动交换 SDP 完成，不需要信令服务器。`iceServers` 默认为空（保持上游行为），可通过 `config.ini` 的 `lanStunUrl` 指向**内网自建**的 STUN —— 见上文「多人对战」一节，那是跨机器对战能否成立的关键，且该 STUN 同样在内网，不构成外网依赖。
 
 ## 授权与法律
 

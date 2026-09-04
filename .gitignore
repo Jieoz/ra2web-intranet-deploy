@@ -3,3 +3,5 @@ webroot/
 redalert2/
 node_modules/
 *.zip
+__pycache__/
+*.pyc

@@ -137,6 +137,170 @@ p.write_text(s)
 print(f"    补丁应用成功（{guarded} 处 this.rfs 调用已加空值保护）")
 PYEOF
 
+echo "==> [4b/7] 应用局域网直连补丁（iceServers 可配置）"
+python3 - <<'PYEOF'
+import pathlib, re, sys
+
+# 为什么需要这个补丁：
+# 上游把两处 RTCPeerConnection 的 iceServers 硬编码成 []，用意是"零外部依赖"。
+# 但现代浏览器默认用 mDNS 假名（<uuid>.local）替代真实内网 IP 上报 host candidate，
+# 于是 SDP 里只有一条 *.local 候选，没有可路由的局域网 IPv4。对端要解析这个名字
+# 得靠 mDNS 广播（UDP 5353），交换机/AP 的客户端隔离常把它丢掉 —— 表现就是
+# 同机开两个标签页能连、两台机器连不上。
+# 上游自己的 SdpCandidateDiagnostics 就为这个组合准备了失败警告文案。
+#
+# 修法：把 iceServers 变成运行期可配置。内网架一个 STUN（仅回 Binding Response，
+# 不做中继），浏览器就会额外采集 srflx 候选，内容正是它的真实内网 IP:端口，
+# 跨机器直连成立，且全程不出内网。不配则保持原行为（空列表）。
+GLOBAL = "globalThis.__ra2LanIceServers"
+
+# 1) Config：暴露 lanStunUrl（读 config.ini 的 [General] lanStunUrl）
+p = pathlib.Path("src/Config.ts")
+s = p.read_text()
+if "lanStunUrl" not in s:
+    anchor = '    get serversUrl(): string {'
+    if anchor not in s:
+        print("!! Config.ts 未找到 serversUrl getter 锚点", file=sys.stderr)
+        sys.exit(1)
+    s = s.replace(anchor,
+        '    get lanStunUrl(): string {\n'
+        '        return this.generalData.getString("lanStunUrl");\n'
+        '    }\n' + anchor, 1)
+    p.write_text(s)
+    print("    Config.ts：已加 lanStunUrl getter")
+
+# 1b) 给 globalThis 上的自定义属性补类型声明。
+# 当前上游 tsconfig 是 strict:false 且 vite 用 esbuild 转译（不做类型检查），
+# 不声明也能构建；但一旦上游打开 strict 就会 TS2339。声明成本为零，先钉住。
+decl = pathlib.Path("src/ra2-lan-ice.d.ts")
+if not decl.exists():
+    decl.write_text(
+        "// 由 build-ra2-intranet.sh 生成：内网 LAN 对战的 iceServers 运行期注入点。\n"
+        "declare global {\n"
+        "    // eslint-disable-next-line no-var\n"
+        "    var __ra2LanIceServers: RTCIceServer[] | undefined;\n"
+        "}\n"
+        "export {};\n")
+    print("    已生成 src/ra2-lan-ice.d.ts（globalThis 类型声明）")
+
+# 2) Application：config 加载完后把 iceServers 发布到 globalThis
+p = pathlib.Path("src/Application.ts")
+s = p.read_text()
+if GLOBAL not in s:
+    anchor = "            console.log('[Application] Verification: Servers URL from config:', this.config.serversUrl);"
+    if anchor not in s:
+        print("!! Application.ts 未找到 config 加载后的锚点", file=sys.stderr)
+        sys.exit(1)
+    s = s.replace(anchor, anchor + '\n'
+        '            const lanStun = this.config.lanStunUrl;\n'
+        '            ' + GLOBAL + ' = lanStun ? [{ urls: lanStun }] : [];\n'
+        "            console.log('[Application] LAN iceServers:', " + GLOBAL + ");", 1)
+    p.write_text(s)
+    print("    Application.ts：已发布 LAN iceServers")
+
+# 3) 两处 RTCPeerConnection 改读该全局值
+# 精确匹配 new RTCPeerConnection({ iceServers: [] }) 的 iceServers 行，
+# 不动周边代码结构；两个文件的写法一致但缩进不同，故按表达式替换。
+targets = [
+    "src/network/lan/LanMeshSession.ts",
+    "src/network/lan/ManualSdpLanSession.ts",
+]
+patched = 0
+for t in targets:
+    p = pathlib.Path(t)
+    s = p.read_text()
+    if GLOBAL in s:
+        patched += 1
+        continue
+    new_s, n = re.subn(r"iceServers:\s*\[\s*\],", "iceServers: " + GLOBAL + " ?? [],", s)
+    if n != 1:
+        print(f"!! {t}: 期望 1 处 iceServers:[]，实际 {n} 处", file=sys.stderr)
+        sys.exit(1)
+    p.write_text(new_s)
+    patched += 1
+
+# 自检：确认两处都不再是硬编码空列表，且 iceServers 键名仍在
+# （上一版正则把键名一起吃掉了，产出 `{ globalThis.x ?? [], }` 这种语法错误，
+#  而"空列表已消失 + 全局名已出现"两个断言全都通过 —— 断言必须钉到键值对本身。）
+for t in targets:
+    s = pathlib.Path(t).read_text()
+    if re.search(r"iceServers:\s*\[\s*\],", s):
+        print(f"!! {t}: 仍存在硬编码 iceServers:[]", file=sys.stderr)
+        sys.exit(1)
+    if not re.search(r"iceServers:\s*" + re.escape(GLOBAL) + r"\s*\?\?\s*\[\]", s):
+        print(f"!! {t}: 未生成 `iceServers: {GLOBAL} ?? []` 键值对", file=sys.stderr)
+        sys.exit(1)
+print(f"    局域网补丁应用成功（{patched} 处 RTCPeerConnection 改为可配置）")
+PYEOF
+
+echo "==> [4c/7] 修正静态资源路径（CSS 相对路径与残留 favicon）"
+python3 - <<'PYEOF'
+import pathlib, re, sys
+
+# main-legacy.css 位于 /css/ 下，里面写的是相对路径 url(res/img/xxx.png)，
+# 浏览器按样式表位置解析成 /css/res/img/xxx.png -> 404（文件实际在 /res/img/）。
+# 改成根绝对路径。cd-logo.png 上游 dist 里根本不存在，连带该规则一起去掉背景引用。
+css = pathlib.Path("public/css/main-legacy.css")
+if not css.exists():
+    css = pathlib.Path("src/css/main-legacy.css")
+if css.exists():
+    s = css.read_text()
+    orig = s
+    s = s.replace("url(res/img/", "url(/res/img/")
+    # cd-logo.png 上游 public/res/img/ 里根本不存在（只有 download-arrow / drag-*），
+    # 引用它必然 404。它写成 `background: url(...) no-repeat center center;` 的简写形式，
+    # 不是 background-image，按 background-image 匹配会漏掉 —— 按 url() 本身匹配。
+    s = re.sub(r"background:\s*url\(/res/img/cd-logo\.png\)[^;]*;",
+               "background: none;", s)
+    s = re.sub(r"\s*background-image:\s*url\(/res/img/cd-logo\.png\);", "", s)
+    if s != orig:
+        css.write_text(s)
+        print(f"    {css}：已修正相对路径引用")
+    else:
+        print(f"    {css}：无需修改")
+    # 自检：产物里不能再有指向不存在文件的引用，也不能残留相对路径
+    chk = css.read_text()
+    if "url(res/img/" in chk:
+        print("!! CSS 仍有相对路径 url(res/img/...)", file=sys.stderr)
+        sys.exit(1)
+    if "cd-logo" in chk:
+        print("!! CSS 仍引用不存在的 cd-logo.png", file=sys.stderr)
+        sys.exit(1)
+else:
+    print("!! 未找到 main-legacy.css", file=sys.stderr)
+    sys.exit(1)
+
+# index.html 的 favicon 指向 Vite 模板残留的 /vite.svg，产物里没有这个文件。
+idx = pathlib.Path("index.html")
+if idx.exists():
+    s = idx.read_text()
+    orig = s
+    # 换成内联 data: URI，而不是单纯删掉这个 <link>：没有 icon 声明时浏览器会自己
+    # 去请求 /favicon.ico，访问日志里照样留一条 404（实测确认）。内联后请求不发出，
+    # 也不必往包里塞图标文件。
+    s = re.sub(r'<link rel="icon"[^>]*href="/vite\.svg"[^>]*/?>',
+               '<link rel="icon" href="data:,">', s)
+    # vite.svg 那行不一定在（上游可能自己删掉，或本树已被旧版补丁处理过）。
+    # 只做替换会留下"完全没有 icon 声明"的状态，浏览器照样请求 /favicon.ico。
+    # 所以缺失时补插一条，而不是依赖那个 <link> 必然存在。
+    if 'rel="icon"' not in s:
+        s = s.replace('</head>', '    <link rel="icon" href="data:,">\n</head>', 1)
+    if s != orig:
+        idx.write_text(s)
+        print("    index.html：favicon 改为内联 data: URI（消除 /favicon.ico 404）")
+    # 自检：产物不能再引用 vite.svg，且必须有一个 icon 声明（否则浏览器自动请求 .ico）
+    chk = idx.read_text()
+    if "vite.svg" in chk:
+        print("!! index.html 仍引用 /vite.svg", file=sys.stderr)
+        sys.exit(1)
+    if 'rel="icon"' not in chk:
+        print("!! index.html 缺少 icon 声明，浏览器会自动请求 /favicon.ico 并 404", file=sys.stderr)
+        sys.exit(1)
+else:
+    print("!! 未找到 index.html", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+
 echo "==> [5/7] 写入内网化配置并构建"
 cat > public/config.ini <<'CFGEOF'
 [General]
@@ -160,21 +324,22 @@ unrankedQueueEnabled=no
 
 viewport.width=1024
 viewport.height=768
+
+# 局域网对战用的 STUN 服务器（留空=保持上游行为，只有 mDNS 候选）。
+# 浏览器默认用 <uuid>.local 假名隐藏真实内网 IP，跨机器直连常因 mDNS 被交换机
+# 拦截而失败。填一个内网 STUN 地址后，浏览器会额外采集 srflx 候选（即自己的
+# 真实内网 IP:端口），跨机器对战才稳。仓库自带 ministun.py 可直接跑，零外网。
+# 例：lanStunUrl=stun:192.168.1.10:3478
+lanStunUrl=
 CFGEOF
 # 清空 MOD 远端清单：上游 mods.ini 里的 Download/Website 全是外网地址（k0s.cn、download.ra2web.com 等）
 cat > public/mods.ini <<'MODEOF'
 [General]
 MODEOF
-cat > public/servers.ini <<'SVCEOF'
-[lan]
-label="内网 LAN 对战"
-available=no
-gameVersion=0.65.1
-wolUrl="wss://localhost/wol"
-apiRegUrl="http://localhost/register"
-wladderUrl="http://localhost/ladder"
-wgameresUrl="http://localhost/wgameres"
-SVCEOF
+# 不写 servers.ini：那是官方战网登录（LoginScreen/WolService）用的服务器列表，
+# 内网 LAN 对战走 WebRTC，完全不读它。之前这里生成过一份带 wolUrl/apiRegUrl 的
+# 占位文件，实测其中每个键在客户端里都没有任何读取方 —— 纯摆设，删掉避免误导。
+rm -f public/servers.ini
 npm ci --no-audit --no-fund
 node ./node_modules/vite/bin/vite.js build
 [ -d dist ] || { echo "!! 构建未产出 dist/" >&2; exit 1; }
