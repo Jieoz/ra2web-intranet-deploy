@@ -183,20 +183,125 @@ if not decl.exists():
         "export {};\n")
     print("    已生成 src/ra2-lan-ice.d.ts（globalThis 类型声明）")
 
-# 2) Application：config 加载完后把 iceServers 发布到 globalThis
+# 1c) 生成 STUN 自动推导 + 探测模块。
+# 为什么不能直接把推导出的地址当默认值用：实测不可达的 STUN 会让 ICE 采集
+# 拖到 ~40 秒才 complete，而上游 waitForIceGatheringComplete 的超时是 10 秒
+# （ICE_GATHER_TIMEOUT_MILLIS，两个 LAN 文件各一份），超时直接抛
+# "ICE 候选收集超时，请稍后重试"。也就是说天真的自动填值会把"没装 STUN 的人
+# 至少能同机联机"变成"等 10 秒然后硬报错"—— 那是回归。
+# 所以先探再用：拿一个一次性 RTCPeerConnection 探 1.5 秒，只有真的收到 srflx
+# 候选才采纳，否则保持空列表（= 上游行为）。探测不 await，因为进 LAN 界面要
+# 好几次点击，1.5 秒早已结束；全局值先钉成 [] 保证任何时刻读到的都是安全值。
+lan_ice = pathlib.Path("src/ra2LanIce.ts")
+lan_ice.write_text('''// 由 build-ra2-intranet.sh 生成：局域网对战的 STUN 自动推导与可用性探测。
+//
+// 浏览器为防指纹，默认用 <uuid>.local 假名替换 host candidate 里的真实内网 IP，
+// JS 层没有任何 API 能读到本机可路由地址。要拿到它只能问一个外部反射点
+// "你看到我从哪来" —— 这就是 STUN 的作用，省不掉。
+// 但地址不必让人填：STUN 就跑在托管本站的那台机器上，而 location.hostname
+// 已经是它。默认按站点来源推导 stun:<hostname>:3478。
+
+const DEFAULT_STUN_PORT = 3478;
+// 实测可达时 srflx 候选在 3ms 内就到，1.5s 是很宽裕的上限。
+const PROBE_TIMEOUT_MILLIS = 1500;
+
+function deriveStunUrl(): string | undefined {
+    const host = globalThis.location?.hostname;
+    if (!host) {
+        return undefined;
+    }
+    return `stun:${host}:${DEFAULT_STUN_PORT}`;
+}
+
+/** 探测该 STUN 是否真能产出 srflx 候选。不可达时靠超时返回 false，不抛。 */
+async function probeStun(url: string): Promise<boolean> {
+    let pc: RTCPeerConnection | undefined;
+    try {
+        pc = new RTCPeerConnection({ iceServers: [{ urls: url }] });
+        pc.createDataChannel('ra2-stun-probe');
+        const gotReflexive = new Promise<boolean>((resolve) => {
+            const timer = setTimeout(() => resolve(false), PROBE_TIMEOUT_MILLIS);
+            pc!.addEventListener('icecandidate', (e) => {
+                const c = e.candidate;
+                if (!c) {
+                    return;
+                }
+                // c.type 在个别实现里可能为空，故同时看候选串本身。
+                if (c.type === 'srflx' || / typ srflx /.test(c.candidate)) {
+                    clearTimeout(timer);
+                    resolve(true);
+                }
+            });
+        });
+        await pc.setLocalDescription(await pc.createOffer());
+        return await gotReflexive;
+    } catch (e) {
+        console.warn('[LAN] STUN 探测出错，按不可用处理：', e);
+        return false;
+    } finally {
+        pc?.close();
+    }
+}
+
+/**
+ * 决定局域网对战用的 iceServers，结果发布到 globalThis.__ra2LanIceServers。
+ * configured 来自 config.ini 的 [General] lanStunUrl：
+ *   留空  = 自动推导 stun:<站点hostname>:3478，探测通过才启用
+ *   off   = 强制关闭，不推导不探测（等同上游行为）
+ *   其它  = 显式指定，同样要探测通过才启用
+ */
+export function initLanIceServers(configured: string): void {
+    // 先钉住安全默认值：任何时刻被读到都是上游行为，探测成功才升级。
+    globalThis.__ra2LanIceServers = [];
+
+    const raw = (configured ?? '').trim();
+    if (raw.toLowerCase() === 'off') {
+        console.log('[LAN] lanStunUrl=off，不使用 STUN（仅 mDNS 候选，跨机器可能连不上）');
+        return;
+    }
+
+    const explicit = raw.length > 0;
+    const url = explicit ? raw : deriveStunUrl();
+    if (!url) {
+        console.warn('[LAN] 无法推导 STUN 地址（拿不到 location.hostname），跳过');
+        return;
+    }
+
+    // 故意不 await：探测最多 1.5s，而玩家要点几次菜单才进得了局域网界面，
+    // 届时全局值早已就位；万一真在探测完成前就进去，读到的是空列表 = 上游行为。
+    void probeStun(url).then((usable) => {
+        if (usable) {
+            globalThis.__ra2LanIceServers = [{ urls: url }];
+            console.log(`[LAN] STUN 可用：${url}（${explicit ? '配置指定' : '按站点自动推导'}）`);
+        } else if (explicit) {
+            console.warn(`[LAN] 配置的 STUN ${url} 探测失败，已退回无 STUN；跨机器对战会连不上。`);
+        } else {
+            console.log(`[LAN] 未在 ${url} 发现 STUN，按无 STUN 运行。`
+                + '跨机器对战需在本站所在机器上运行 ministun.py。');
+        }
+    });
+}
+''')
+print("    已生成 src/ra2LanIce.ts（自动推导 + 可用性探测）")
+
+# 2) Application：config 加载完后初始化 LAN iceServers
 p = pathlib.Path("src/Application.ts")
 s = p.read_text()
-if GLOBAL not in s:
+if "initLanIceServers" not in s:
+    imp_anchor = "import { Config } from './Config';"
+    if imp_anchor not in s:
+        print("!! Application.ts 未找到 Config import 锚点", file=sys.stderr)
+        sys.exit(1)
+    s = s.replace(imp_anchor,
+        imp_anchor + "\nimport { initLanIceServers } from './ra2LanIce';", 1)
     anchor = "            console.log('[Application] Verification: Servers URL from config:', this.config.serversUrl);"
     if anchor not in s:
         print("!! Application.ts 未找到 config 加载后的锚点", file=sys.stderr)
         sys.exit(1)
     s = s.replace(anchor, anchor + '\n'
-        '            const lanStun = this.config.lanStunUrl;\n'
-        '            ' + GLOBAL + ' = lanStun ? [{ urls: lanStun }] : [];\n'
-        "            console.log('[Application] LAN iceServers:', " + GLOBAL + ");", 1)
+        '            initLanIceServers(this.config.lanStunUrl);', 1)
     p.write_text(s)
-    print("    Application.ts：已发布 LAN iceServers")
+    print("    Application.ts：已接入 initLanIceServers")
 
 # 3) 两处 RTCPeerConnection 改读该全局值
 # 精确匹配 new RTCPeerConnection({ iceServers: [] }) 的 iceServers 行，
@@ -230,7 +335,30 @@ for t in targets:
     if not re.search(r"iceServers:\s*" + re.escape(GLOBAL) + r"\s*\?\?\s*\[\]", s):
         print(f"!! {t}: 未生成 `iceServers: {GLOBAL} ?? []` 键值对", file=sys.stderr)
         sys.exit(1)
-print(f"    局域网补丁应用成功（{patched} 处 RTCPeerConnection 改为可配置）")
+
+# 自检：自动推导链必须真的接上。
+# 注意区分两类断言的承重程度：Application.ts 那两条是真承重的（补丁没接上就红，
+# 已消融验证）；下面对 ra2LanIce.ts 的四条是**漂移守卫**——该文件由本脚本整份
+# 生成，断言读的是自己刚写下的字面量，只能在"以后有人改了 heredoc 却忘了同步
+# 断言"时报警，不构成对源码树的验证。写清楚免得后人误以为它在验证运行时行为。
+app = pathlib.Path("src/Application.ts").read_text()
+if "import { initLanIceServers } from './ra2LanIce';" not in app:
+    print("!! Application.ts 缺少 initLanIceServers 的 import", file=sys.stderr)
+    sys.exit(1)
+if "initLanIceServers(this.config.lanStunUrl)" not in app:
+    print("!! Application.ts 未调用 initLanIceServers(this.config.lanStunUrl)", file=sys.stderr)
+    sys.exit(1)
+ice_mod = pathlib.Path("src/ra2LanIce.ts").read_text()
+for need, why in [
+    ("location?.hostname", "缺少按站点推导 hostname 的逻辑"),
+    ("srflx", "探测未检查 srflx 候选，等于没验证 STUN 可用性"),
+    (GLOBAL + " = [{ urls: url }]", "探测通过后未写回全局 iceServers"),
+    (GLOBAL + " = [];", "缺少安全默认值（探测完成前必须是空列表）"),
+]:
+    if need not in ice_mod:
+        print(f"!! ra2LanIce.ts: {why}", file=sys.stderr)
+        sys.exit(1)
+print(f"    局域网补丁应用成功（{patched} 处 RTCPeerConnection 改为可配置，STUN 地址自动推导）")
 PYEOF
 
 echo "==> [4c/7] 修正静态资源路径（CSS 相对路径与残留 favicon）"
@@ -325,11 +453,14 @@ unrankedQueueEnabled=no
 viewport.width=1024
 viewport.height=768
 
-# 局域网对战用的 STUN 服务器（留空=保持上游行为，只有 mDNS 候选）。
-# 浏览器默认用 <uuid>.local 假名隐藏真实内网 IP，跨机器直连常因 mDNS 被交换机
-# 拦截而失败。填一个内网 STUN 地址后，浏览器会额外采集 srflx 候选（即自己的
-# 真实内网 IP:端口），跨机器对战才稳。仓库自带 ministun.py 可直接跑，零外网。
-# 例：lanStunUrl=stun:192.168.1.10:3478
+# 局域网对战用的 STUN 服务器。**默认留空即自动**：客户端按站点地址推导
+# stun:<本站hostname>:3478，启动时探测 1.5 秒，确认能拿到 srflx 候选才启用；
+# 探测不到就按无 STUN 运行（等同上游行为，不影响同机联机）。
+# 所以正常情况下你只需在这台机器上跑 `python3 ministun.py 0.0.0.0 3478`，
+# 这里不用改。
+#   留空  = 自动推导 + 探测（推荐）
+#   off   = 强制不用 STUN
+#   显式值 = 指定别的地址，例 lanStunUrl=stun:192.168.1.10:3478
 lanStunUrl=
 CFGEOF
 # 清空 MOD 远端清单：上游 mods.ini 里的 Download/Website 全是外网地址（k0s.cn、download.ra2web.com 等）

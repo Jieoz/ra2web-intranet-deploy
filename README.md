@@ -67,7 +67,7 @@ cd webroot && python3 -m http.server 8080 --bind 0.0.0.0
 
 生产环境建议换 nginx / caddy，别用 `http.server`（单线程、无并发）。
 
-### 多人对战：必须配内网 STUN
+### 多人对战：需要一个内网 STUN
 
 主菜单 → **局域网联机** → 创建房间，把邀请码（二维码或文本）给对方即可。信令
 不经服务器，靠玩家自己传递。
@@ -85,33 +85,58 @@ a=candidate:... 09cd5807-...-9407d07729a1.local 51158 typ host
 `SdpCandidateDiagnostics.ts` 就为这个组合准备了警告文案，原话是「跨机器局域网很
 容易因为 mDNS/UDP 被拦而失败」。
 
-解法是给它一个内网 STUN 服务器。浏览器会额外采集 srflx 候选，内容正是自己的真实
-内网 IP:端口，直连即可成立 —— 且请求只发到你自己的内网地址，不出网。
+浏览器**拿不到自己的内网 IP**，这是刻意的防指纹设计，JS 层没有任何 API 能读到本机
+可路由地址。要知道自己的地址，唯一办法是问一个外部反射点「你看到我从哪来」——
+这就是 STUN 的全部作用，省不掉。它回报的 srflx 候选内容正是你的真实内网 IP:端口，
+直连即可成立，且请求只发到你自己的内网地址，不出网。
 
-仓库自带 `ministun.py`（纯标准库，约 70 行，只实现 STUN Binding，不做 TURN 中继）：
+仓库自带 `ministun.py`（纯标准库，约 90 行，只实现 STUN Binding，不做 TURN 中继）。
+**在托管站点的那台机器上跑起来就行，不用配地址**：
 
 ```bash
-python3 ministun.py 0.0.0.0 3478          # 在托管站点的那台机器上跑
+python3 ministun.py 0.0.0.0 3478
 ```
+
+客户端按站点地址自动推导 `stun:<本站hostname>:3478` —— STUN 与站点同机，而浏览器
+本来就知道站点地址，没有需要人填的信息。启动时会探测 1.5 秒确认真能拿到 srflx
+候选，拿到才启用。
 
 > STUN Binding 协议本身不带认证，任何人发请求都会得到回应。这个端口只放在可信
 > 内网，**别把 3478/udp 映射到公网** —— 源 IP 可伪造，公网开放 STUN 会被当作 UDP
 > 反射放大源。能指定内网网卡地址就别用 `0.0.0.0`。
 
-然后在 `webroot/config.ini` 里填上它的地址（改完刷新页面即可，**不用重新构建**）：
+`config.ini` 里的 `lanStunUrl` 只在偏离默认时才需要动：
 
 ```ini
-lanStunUrl=stun:192.168.1.10:3478
+lanStunUrl=                        # 留空（默认）= 自动推导 + 探测
+lanStunUrl=off                     # 强制不用 STUN
+lanStunUrl=stun:192.168.1.10:3478  # STUN 在另一台机器，或换了端口
 ```
 
-配置前后的实测对比：
+改完刷新页面即可，**不用重新构建**。
 
-| | 候选数 | 内容 | 跨机器 |
+为什么要探测而不是直接用推导值：不可达的 STUN 会让 ICE 采集拖到约 40 秒才结束，
+而上游 `waitForIceGatheringComplete` 的超时是 10 秒（`ICE_GATHER_TIMEOUT_MILLIS`），
+超时直接抛「ICE 候选收集超时，请稍后重试」。天真的自动填值会把「没装 STUN 至少
+还能同机联机」变成「等 10 秒然后硬报错」，那是回归。探测失败就退回空列表，行为与
+上游完全一致。
+
+三种情形的实测结果：
+
+| 情形 | `__ra2LanIceServers` | ICE 采集 | 候选 |
 |---|---|---|---|
-| `lanStunUrl=` 留空 | 1 | 仅 `*.local` | 很可能失败 |
-| 配上内网 STUN | 2 | 多一条 `172.19.0.33 typ srflx` | 可直连 |
+| STUN 在跑（自动推导命中） | `[{urls:"stun:…:3478"}]` | 115ms | host + **srflx** |
+| STUN 没跑（探测失败退回） | `[]` | 124ms | 仅 host |
+| `lanStunUrl=off` | `[]` | 118ms | 仅 host |
 
-若内网禁 UDP 3478，换个端口即可（`ministun.py 0.0.0.0 19302`，配置里同步改）。
+两种没有 STUN 的情形都远低于 10 秒超时，即未启用 STUN 时无任何行为变化。
+
+跨机器可行性用双 peer 实测过：两个独立浏览器 context，信令层剔除所有 host 候选
+（模拟对端无法解析 `.local`），仅凭 srflx 候选在 2.5 秒内完成双向 DataChannel
+通信。反过来把 STUN 停掉，同一测试 30 秒都建不起连接。
+
+若内网禁 UDP 3478，换端口时两边都要改（`ministun.py 0.0.0.0 19302` +
+`lanStunUrl=stun:<IP>:19302`）。
 
 > 另外：本项目**不生成 `servers.ini`**。那是官方战网登录（`LoginScreen` /
 > `WolService`）读的服务器列表，局域网对战走 WebRTC，完全不碰它。早期版本这里
@@ -124,7 +149,7 @@ lanStunUrl=stun:192.168.1.10:3478
 
 2. **清空所有外网引用** — `config.ini` 里的资源包下载地址、更新公告、排行榜规则、mod SDK、Discord 链接全部置空；`mods.ini` 的远端 MOD 清单清空（上游那份的 Download / Website 全指向 k0s.cn 等外网）。全仓唯一剩余硬编码外链是 Sentry，而不配置 `[Sentry]` 段就不会加载。官方对战服不需要专门摘除——局域网对战走 WebRTC，客户端这个版本压根不读服务器列表（见上文 `servers.ini` 注）。
 
-3. **局域网 ICE 可配置** — 上游两处 `RTCPeerConnection` 把 `iceServers` 写死成 `[]`。补丁给 `Config.ts` 加 `lanStunUrl` getter，`Application.ts` 在 config 加载完成后把算好的列表发布到 `globalThis.__ra2LanIceServers`，两处构造点改读它。**默认空值即上游行为**，`config.ini` 不填就完全不变。附带生成 `src/ra2-lan-ice.d.ts` 声明该全局，避免 `tsc` 报错。
+3. **局域网 ICE 自动化** — 上游两处 `RTCPeerConnection` 把 `iceServers` 写死成 `[]`，跨机器对战因此拿不到可路由候选。补丁给 `Config.ts` 加 `lanStunUrl` getter，生成 `src/ra2LanIce.ts` 负责按 `location.hostname` 推导 STUN 地址、探测可用性并发布到 `globalThis.__ra2LanIceServers`，`Application.ts` 在 config 加载完成后调用它，两处构造点改读该全局值。**默认无需配置**：STUN 与站点同机，地址可推导；探测失败则退回 `[]`，行为与上游完全一致。附带生成 `src/ra2-lan-ice.d.ts` 声明该全局，避免 `tsc` 报错。
 
 4. **静态资源修复** — `main-legacy.css` 里 `url(res/img/...)` 是相对路径，而 CSS 自己在 `/css/` 下，浏览器解析成 `/css/res/img/...` 全部 404，改为绝对路径；同一份 CSS 引用的 `cd-logo.png` 上游 `public/res/img/` 里根本不存在（只有 `download-arrow` / `drag-*`），去掉那条 `background` 简写里的 `url()`；`index.html` 的 favicon 指向 Vite 模板残留的 `/vite.svg`，换成内联 `data:` URI —— 单纯删掉 `<link>` 是不够的，那样浏览器会自己去请求 `/favicon.ico`，日志里照样一条 404。
 
