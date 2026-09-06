@@ -17,6 +17,7 @@
 import socket
 import struct
 import sys
+from typing import Optional
 
 MAGIC = 0x2112A442
 BIND_REQUEST = 0x0001
@@ -44,7 +45,10 @@ def mapped_address(ip: str, port: int) -> bytes:
     return struct.pack("!HH", ATTR_MAPPED_ADDRESS, len(value)) + value
 
 
-def handle(data: bytes, addr) -> bytes | None:
+# 注解写 Optional[bytes] 而不是 `bytes | None`：后者是 Python 3.10+ 语法，
+# 而这个脚本要能在部署机上直接跑 —— 实测 Ubuntu 18.04 自带 python3.6 会以
+# TypeError: unsupported operand type(s) for |: 'type' and 'NoneType' 直接崩。
+def handle(data: bytes, addr) -> Optional[bytes]:
     if len(data) < 20:
         return None
     msg_type, msg_len, magic = struct.unpack("!HHI", data[:8])

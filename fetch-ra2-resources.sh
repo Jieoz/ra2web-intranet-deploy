@@ -13,6 +13,12 @@
 
 set -euo pipefail
 
+# 脚本里内嵌的 python 段会打印中文。实测基准部署机（Ubuntu 18.04，LANG 为空、
+# locale 是 POSIX）下 python 的 stdout 编码会退化成 ASCII，任何中文 print 都以
+# UnicodeEncodeError 崩掉，而崩溃点在下载循环中途、看起来像网络错误。
+# 中文输出是本脚本自己的选择，兼容责任在脚本这边，不该要求部署者先设 locale。
+export PYTHONIOENCODING=utf-8
+
 WEBROOT="${1:-client}"
 [ -d "$WEBROOT" ] || { echo "!! 找不到客户端目录：$WEBROOT" >&2; exit 1; }
 [ -f "$WEBROOT/index.html" ] || { echo "!! $WEBROOT 里没有 index.html，不像是客户端目录" >&2; exit 1; }
@@ -41,10 +47,12 @@ REFERER = "https://game.ra2web.com/"
 
 def curl(url, dst, timeout=180):
     """下载到 dst。返回 True 表示 curl 认为成功（内容是否可用由调用方校验）。"""
+    # 用 stdout/stderr=PIPE 而不是 capture_output/text（那两个是 Python 3.7+）：
+    # 部署基准机 Ubuntu 18.04 自带 python3.6，capture_output 会抛 TypeError。
     r = subprocess.run(
         ["curl", "-sS", "-f", "--max-time", str(timeout),
          "-A", UA, "-e", REFERER, "-o", dst, url],
-        capture_output=True, text=True)
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return r.returncode == 0
 
 def crc(path):

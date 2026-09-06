@@ -13,6 +13,11 @@
 # 环境变量：RA2_FORCE_NODE=1  强制使用便携版 Node（忽略系统 node）
 set -euo pipefail
 
+# 内嵌 python 段打印中文，而基准部署机（Ubuntu 18.04）LANG 为空、locale=POSIX，
+# python 的 stdout 编码会退化成 ASCII，中文 print 直接 UnicodeEncodeError。
+# 见 fetch-ra2-resources.sh 同一处注释。
+export PYTHONIOENCODING=utf-8
+
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="${1:-./ra2-intranet}"
 mkdir -p "$OUT"
@@ -24,6 +29,23 @@ NODE_LTS="v24.20.0"         # vite 8 / rolldown 需要 node ^20.19 || >=22.12
 UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
 echo "==> [1/7] 准备目录 $OUT"
+# 基准部署机兼容自检。这台机器是 Ubuntu 18.04 / python3.6.9 / LANG 空（locale=POSIX），
+# 下面这些不兼容在开发机（python3.13）上一个都不报错，只在基准机上崩，
+# 而且崩点常在下载或补丁循环中途，看起来像网络故障或上游结构变更。
+# 放在最前面：宁可 0 秒失败，也不要下完 190M 资源再崩。
+if [ -f "$SELF_DIR/check_py36_compat.py" ]; then
+    python3 "$SELF_DIR/check_py36_compat.py" \
+        "$SELF_DIR/build-ra2-intranet.sh" \
+        "$SELF_DIR/fetch-ra2-resources.sh" \
+        "$SELF_DIR/ministun.py" >/dev/null || {
+        echo "!! 基准机兼容检查未通过，详情：" >&2
+        python3 "$SELF_DIR/check_py36_compat.py" \
+            "$SELF_DIR/build-ra2-intranet.sh" \
+            "$SELF_DIR/fetch-ra2-resources.sh" \
+            "$SELF_DIR/ministun.py" >&2
+        exit 1
+    }
+fi
 # webroot 必须在这里建。它曾经是靠 [7/7] 资源拉取里 mkdir -p "$WEBROOT/cdn/..."
 # 的副作用产生的，后来资源拉取被抽成独立脚本、执行顺序调到同步产物之后，
 # 那个副作用就没了 —— 于是全新目录跑到 [6/7] 的 find "$WEBROOT" 直接失败。
@@ -105,7 +127,7 @@ python3 - <<'PYEOF'
 import pathlib, re, sys
 
 p = pathlib.Path("src/data/vfs/VirtualFileSystem.ts")
-s = p.read_text()
+s = p.read_text(encoding="utf-8")
 orig = s
 
 # 幂等：已打过补丁直接返回（否则 openFile 正则会二次嵌套）
@@ -139,7 +161,7 @@ if raw != guarded:
     print(f"!! 自检失败：this.rfs 调用 {raw} 处，受保护 {guarded} 处", file=sys.stderr)
     sys.exit(1)
 
-p.write_text(s)
+p.write_text(s, encoding="utf-8")
 print(f"    补丁应用成功（{guarded} 处 this.rfs 调用已加空值保护）")
 PYEOF
 
@@ -162,7 +184,7 @@ GLOBAL = "globalThis.__ra2LanIceServers"
 
 # 1) Config：暴露 lanStunUrl（读 config.ini 的 [General] lanStunUrl）
 p = pathlib.Path("src/Config.ts")
-s = p.read_text()
+s = p.read_text(encoding="utf-8")
 if "lanStunUrl" not in s:
     anchor = '    get serversUrl(): string {'
     if anchor not in s:
@@ -172,7 +194,7 @@ if "lanStunUrl" not in s:
         '    get lanStunUrl(): string {\n'
         '        return this.generalData.getString("lanStunUrl");\n'
         '    }\n' + anchor, 1)
-    p.write_text(s)
+    p.write_text(s, encoding="utf-8")
     print("    Config.ts：已加 lanStunUrl getter")
 
 # 1b) 给 globalThis 上的自定义属性补类型声明。
@@ -186,7 +208,7 @@ if not decl.exists():
         "    // eslint-disable-next-line no-var\n"
         "    var __ra2LanIceServers: RTCIceServer[] | undefined;\n"
         "}\n"
-        "export {};\n")
+        "export {};\n", encoding="utf-8")
     print("    已生成 src/ra2-lan-ice.d.ts（globalThis 类型声明）")
 
 # 1c) 生成 STUN 自动推导 + 探测模块。
@@ -287,12 +309,12 @@ export function initLanIceServers(configured: string): void {
         }
     });
 }
-''')
+''', encoding="utf-8")
 print("    已生成 src/ra2LanIce.ts（自动推导 + 可用性探测）")
 
 # 2) Application：config 加载完后初始化 LAN iceServers
 p = pathlib.Path("src/Application.ts")
-s = p.read_text()
+s = p.read_text(encoding="utf-8")
 if "initLanIceServers" not in s:
     imp_anchor = "import { Config } from './Config';"
     if imp_anchor not in s:
@@ -306,7 +328,7 @@ if "initLanIceServers" not in s:
         sys.exit(1)
     s = s.replace(anchor, anchor + '\n'
         '            initLanIceServers(this.config.lanStunUrl);', 1)
-    p.write_text(s)
+    p.write_text(s, encoding="utf-8")
     print("    Application.ts：已接入 initLanIceServers")
 
 # 3) 两处 RTCPeerConnection 改读该全局值
@@ -319,7 +341,7 @@ targets = [
 patched = 0
 for t in targets:
     p = pathlib.Path(t)
-    s = p.read_text()
+    s = p.read_text(encoding="utf-8")
     if GLOBAL in s:
         patched += 1
         continue
@@ -327,14 +349,14 @@ for t in targets:
     if n != 1:
         print(f"!! {t}: 期望 1 处 iceServers:[]，实际 {n} 处", file=sys.stderr)
         sys.exit(1)
-    p.write_text(new_s)
+    p.write_text(new_s, encoding="utf-8")
     patched += 1
 
 # 自检：确认两处都不再是硬编码空列表，且 iceServers 键名仍在
 # （上一版正则把键名一起吃掉了，产出 `{ globalThis.x ?? [], }` 这种语法错误，
 #  而"空列表已消失 + 全局名已出现"两个断言全都通过 —— 断言必须钉到键值对本身。）
 for t in targets:
-    s = pathlib.Path(t).read_text()
+    s = pathlib.Path(t).read_text(encoding="utf-8")
     if re.search(r"iceServers:\s*\[\s*\],", s):
         print(f"!! {t}: 仍存在硬编码 iceServers:[]", file=sys.stderr)
         sys.exit(1)
@@ -347,14 +369,14 @@ for t in targets:
 # 已消融验证）；下面对 ra2LanIce.ts 的四条是**漂移守卫**——该文件由本脚本整份
 # 生成，断言读的是自己刚写下的字面量，只能在"以后有人改了 heredoc 却忘了同步
 # 断言"时报警，不构成对源码树的验证。写清楚免得后人误以为它在验证运行时行为。
-app = pathlib.Path("src/Application.ts").read_text()
+app = pathlib.Path("src/Application.ts").read_text(encoding="utf-8")
 if "import { initLanIceServers } from './ra2LanIce';" not in app:
     print("!! Application.ts 缺少 initLanIceServers 的 import", file=sys.stderr)
     sys.exit(1)
 if "initLanIceServers(this.config.lanStunUrl)" not in app:
     print("!! Application.ts 未调用 initLanIceServers(this.config.lanStunUrl)", file=sys.stderr)
     sys.exit(1)
-ice_mod = pathlib.Path("src/ra2LanIce.ts").read_text()
+ice_mod = pathlib.Path("src/ra2LanIce.ts").read_text(encoding="utf-8")
 for need, why in [
     ("location?.hostname", "缺少按站点推导 hostname 的逻辑"),
     ("srflx", "探测未检查 srflx 候选，等于没验证 STUN 可用性"),
@@ -378,7 +400,7 @@ css = pathlib.Path("public/css/main-legacy.css")
 if not css.exists():
     css = pathlib.Path("src/css/main-legacy.css")
 if css.exists():
-    s = css.read_text()
+    s = css.read_text(encoding="utf-8")
     orig = s
     s = s.replace("url(res/img/", "url(/res/img/")
     # cd-logo.png 上游 public/res/img/ 里根本不存在（只有 download-arrow / drag-*），
@@ -388,12 +410,12 @@ if css.exists():
                "background: none;", s)
     s = re.sub(r"\s*background-image:\s*url\(/res/img/cd-logo\.png\);", "", s)
     if s != orig:
-        css.write_text(s)
+        css.write_text(s, encoding="utf-8")
         print(f"    {css}：已修正相对路径引用")
     else:
         print(f"    {css}：无需修改")
     # 自检：产物里不能再有指向不存在文件的引用，也不能残留相对路径
-    chk = css.read_text()
+    chk = css.read_text(encoding="utf-8")
     if "url(res/img/" in chk:
         print("!! CSS 仍有相对路径 url(res/img/...)", file=sys.stderr)
         sys.exit(1)
@@ -407,7 +429,7 @@ else:
 # index.html 的 favicon 指向 Vite 模板残留的 /vite.svg，产物里没有这个文件。
 idx = pathlib.Path("index.html")
 if idx.exists():
-    s = idx.read_text()
+    s = idx.read_text(encoding="utf-8")
     orig = s
     # 换成内联 data: URI，而不是单纯删掉这个 <link>：没有 icon 声明时浏览器会自己
     # 去请求 /favicon.ico，访问日志里照样留一条 404（实测确认）。内联后请求不发出，
@@ -420,10 +442,10 @@ if idx.exists():
     if 'rel="icon"' not in s:
         s = s.replace('</head>', '    <link rel="icon" href="data:,">\n</head>', 1)
     if s != orig:
-        idx.write_text(s)
+        idx.write_text(s, encoding="utf-8")
         print("    index.html：favicon 改为内联 data: URI（消除 /favicon.ico 404）")
     # 自检：产物不能再引用 vite.svg，且必须有一个 icon 声明（否则浏览器自动请求 .ico）
-    chk = idx.read_text()
+    chk = idx.read_text(encoding="utf-8")
     if "vite.svg" in chk:
         print("!! index.html 仍引用 /vite.svg", file=sys.stderr)
         sys.exit(1)
