@@ -512,6 +512,13 @@ echo "==> [6/7] 同步构建产物到 webroot"
 [ -d "$WEBROOT" ] || { echo "!! $WEBROOT 不存在（[1/7] 应已创建）" >&2; exit 1; }
 find "$WEBROOT" -mindepth 1 -maxdepth 1 ! -name cdn -exec rm -rf {} +
 cp -r "$REPO/dist/." "$WEBROOT/"
+# WebGL 自检页：目标机排障用（浏览器打开 /webgl-check.html 即出结论），
+# 源文件在仓库根（不进 vite dist），这里直接拷。
+if [ -f "$SELF_DIR/webgl-check.html" ]; then
+    cp "$SELF_DIR/webgl-check.html" "$WEBROOT/webgl-check.html"
+else
+    echo "    (跳过 webgl-check.html：仓库根未找到源文件)"
+fi
 # 产出自检：这几个是客户端启动必读的文件，缺任何一个都进不了主菜单。
 for f in index.html config.ini mods.ini general.csf ini.mix; do
     [ -s "$WEBROOT/$f" ] || { echo "!! webroot 缺少 $f" >&2; exit 1; }

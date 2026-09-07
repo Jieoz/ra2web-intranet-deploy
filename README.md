@@ -172,6 +172,18 @@ lanStunUrl=stun:192.168.1.10:3478  # STUN 在另一台机器，或换了端口
 
 局域网联机走上游内置的 WebRTC mesh（`src/network/lan/`），信令通过二维码或手动交换 SDP 完成，不需要信令服务器。`iceServers` 默认为空（保持上游行为），可通过 `config.ini` 的 `lanStunUrl` 指向**内网自建**的 STUN —— 见上文「多人对战」一节，那是跨机器对战能否成立的关键，且该 STUN 同样在内网，不构成外网依赖。
 
+## 客户端打不开游戏（WebGL 排障）
+
+游戏客户端用 Three.js 渲染，**必须 WebGL2**。老机器（无 3D 加速的虚拟机、老麒麟/统信等）常见症状：资源全部加载成功后控制台报 `THREE.WebGLRenderer: A WebGL context could not be created ... BindToCurrentSequence failed`，然后黑屏/卡加载——这是浏览器建不出 WebGL 上下文，不是站点问题。
+
+按顺序处理：
+
+1. **自检页**：浏览器直接打开 `http://<站点>/webgl-check.html`。页面显示 `WEBGL2-OK`（能玩）或 `WEBGL2-FAIL`（不能玩），并给出真实 renderer 字符串。
+2. **自动适配探针**：在打不开游戏的那台机器上跑 `ra2-browser-probe.sh`（拷过去即可，无需 root）。它会把机上每台已装浏览器（360/lbrowser/chromium 等）× 7 组渲染参数（EGL/GLES 优先、SwiftShader 兜底）逐组合实测，第一个能出 WebGL2 的组合自动生成本机启动器 `~/ra2-browser-fix/ra2-launch.sh`——以后双击它就能进游戏。全部失败时把 `~/ra2-browser-fix/` 下的日志发回来判读。
+3. **手动兜底**（想自己试参数时）：给机上的 Chromium 系浏览器加启动参数 `--use-angle=gles --enable-unsafe-swiftshader --ignore-gpu-blocklist`，走 EGL/GLES 的 llvmpipe（绕开默认 GLX/ANGLE 路径的 `BindToCurrentSequence failed`）。Firefox 52 这类老版本无 WebGL2，直接排除。
+
+硬件上真正的解法是给虚拟机开 3D 加速（virtio-gpu/VirGL），浏览器参数只是软件兜底，帧数有限。
+
 ## 授权与法律
 
 - 本仓库脚本：GPL-3.0（与上游一致）

@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>WebGL 自检</title>
+</head>
+<body style="background:#141414;color:#33ff66;font-family:monospace;padding:16px;line-height:1.5">
+<h2>RA2Web WebGL 自检</h2>
+<pre id="out">检测中...</pre>
+<script>
+/*
+ * ra2-webgl-check.html — WebGL 能力自检（网页红警2 目标机适配用）
+ *
+ * 两种用法：
+ *  1) 人看：直接从站点打开，页面显示结论（WEBGL2-OK / WEBGL2-FAIL）。
+ *  2) 探针：URL 带 ?beacon=<端口> 时，把结论用图片信标 POST 回 127.0.0.1:<端口>
+ *     （图片子资源加载无 CORS 限制，Chromium 69~151 / Firefox 52 全兼容）。
+ * 设计约束：
+ *  - ES5 语法（无箭头函数/模板串/async），Firefox 52 也能执行
+ *  - 全同步检测（getContext 立即返回），load 后结论即进 DOM
+ *  此文件与 ra2-browser-probe.sh 内嵌副本同源；改这里必须同步改脚本内 heredoc。
+ */
+(function () {
+    function line(s) {
+        document.getElementById('out').textContent += s + "\n";
+    }
+    function info(gl) {
+        var r = '(浏览器隐藏)', v = '(浏览器隐藏)';
+        try {
+            var d = gl.getExtension('WEBGL_debug_renderer_info');
+            if (d) {
+                r = gl.getParameter(d.UNMASKED_RENDERER_WEBGL);
+                v = gl.getParameter(d.UNMASKED_VENDOR_WEBGL);
+            }
+        } catch (e) { r = '(取renderer出错: ' + e + ')'; }
+        var mt = '?';
+        try { mt = gl.getParameter(gl.MAX_TEXTURE_SIZE); } catch (e) {}
+        var ver = '?';
+        try { ver = gl.getParameter(gl.VERSION); } catch (e) {}
+        return '    RENDERER: ' + r + "\n" +
+               '    VENDOR: ' + v + "\n" +
+               '    GL_VERSION: ' + ver + "\n" +
+               '    MAX_TEXTURE_SIZE: ' + mt + "\n";
+    }
+    var out = document.getElementById('out');
+    out.textContent = '';
+    var BPORT = null;
+    try {
+        var m = location.search.match(/[?&]beacon=(\d+)/);
+        if (m) BPORT = m[1];
+    } catch (e) {}
+    function beacon(path) {
+        if (!BPORT) return;
+        try { new Image().src = 'http://127.0.0.1:' + BPORT + path; } catch (e) {}
+    }
+    beacon('/start');
+    var ok = false;
+    try {
+        var g1 = null, g2 = null;
+        try { g1 = document.createElement('canvas').getContext('webgl') ||
+                   document.createElement('canvas').getContext('experimental-webgl'); } catch (e) {}
+        try { g2 = document.createElement('canvas').getContext('webgl2'); } catch (e) {}
+        line('WebGL1: ' + (g1 ? '可用' : '不可用'));
+        if (g1) line(info(g1));
+        line('WebGL2: ' + (g2 ? '可用' : '不可用'));
+        if (g2) line(info(g2));
+        var mt2 = 0;
+        try { mt2 = g2 ? g2.getParameter(g2.MAX_TEXTURE_SIZE) : 0; } catch (e) {}
+        ok = !!g2 && mt2 >= 2048;
+        line(ok ? '结论: WEBGL2-OK 该浏览器可运行 RA2Web'
+                : '结论: WEBGL2-FAIL 无法运行（游戏需要 WebGL2，本机/本浏览器未提供）');
+        document.title = ok ? 'WEBGL2-OK' : 'WEBGL2-FAIL';
+    } catch (e) {
+        line('结论: WEBGL2-FAIL 检测异常: ' + e);
+        document.title = 'WEBGL2-FAIL';
+    }
+    var rBrief = '';
+    try {
+        var g3 = ok ? g2 : (g1 || g2);
+        if (g3) {
+            var dd = g3.getExtension('WEBGL_debug_renderer_info');
+            if (dd) rBrief = String(g3.getParameter(dd.UNMASKED_RENDERER_WEBGL));
+        }
+    } catch (e) {}
+    beacon('/r?ok=' + (ok ? 1 : 0) + '&r=' + encodeURIComponent(rBrief));
+})();
+</script>
+</body>
+</html>
